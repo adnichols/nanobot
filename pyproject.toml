@@ -105,3 +105,6 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "opencode_real: opt-in smoke tests that require a local OpenCode binary",
+]

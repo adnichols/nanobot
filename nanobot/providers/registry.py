@@ -254,6 +254,24 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         model_overrides=(),
     ),
 
+    # Synthetic.ai: OpenAI-compatible endpoint via LiteLLM's openai provider.
+    ProviderSpec(
+        name="synthetic",
+        keywords=("synthetic",),
+        env_key="SYNTHETIC_API_KEY",
+        display_name="Synthetic",
+        litellm_prefix="openai",            # claude-sonnet-4-5 → openai/claude-sonnet-4-5
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=False,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="",
+        default_api_base="https://api.synthetic.ai/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
+
     # Gemini: needs "gemini/" prefix for LiteLLM.
     ProviderSpec(
         name="gemini",
@@ -354,6 +372,25 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=False,
         model_overrides=(),
     ),
+
+    # Synthetic: OpenAI-compatible API gateway.
+    ProviderSpec(
+        name="synthetic",
+        keywords=("synthetic",),
+        env_key="SYNTHETIC_API_KEY",
+        display_name="Synthetic",
+        litellm_prefix="openai",            # Uses OpenAI-compatible endpoint
+        skip_prefixes=("openai/",),
+        env_extras=(),
+        is_gateway=False,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="",
+        default_api_base="https://api.synthetic.ai/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
+
 
     # === Local deployment (matched by config key, NOT by api_base) =========
 

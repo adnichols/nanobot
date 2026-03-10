@@ -869,6 +869,90 @@ Use `toolTimeout` to override the default 30s per-call timeout for slow servers:
 MCP tools are automatically discovered and registered on startup. The LLM can use them alongside built-in tools — no extra configuration needed.
 
 
+### ACP (Agent Communication Protocol)
+
+> [!TIP]
+> ACP mode lets nanobot delegate to external agent backends like OpenCode. This enables powerful agentic workflows while keeping nanobot's channel integrations.
+
+nanobot supports [ACP](https://github.com/AgentProtocol/agent-protocol) — a standardized protocol for communicating with external AI agents. The first supported backend is **OpenCode**.
+
+#### When to use ACP vs local mode
+
+| Mode | Use case |
+|------|----------|
+| **Local** (default) | Direct LLM calls — simple, fast, no external dependencies |
+| **ACP** | Agentic workflows requiring tool use, session persistence, or advanced reasoning |
+
+#### Configuration
+
+Add ACP agents to your `config.json`:
+
+```json
+{
+  "acp": {
+    "defaultAgent": "opencode-agent",
+    "agents": {
+      "opencode-agent": {
+        "id": "opencode-agent",
+        "command": "opencode",
+        "args": ["acp"],
+        "cwd": "/path/to/workspace",
+        "capabilities": ["read", "write", "bash", "grep", "glob", "webfetch", "memory"],
+        "policy": "ask"
+      }
+    }
+  }
+}
+```
+
+| Option | Description |
+|--------|-------------|
+| `defaultAgent` | The agent to use when ACP mode is enabled |
+| `agents.*.command` | Path to the agent executable (e.g., `opencode`) |
+| `agents.*.args` | Arguments for the agent (typically `["acp"]`) |
+| `agents.*.cwd` | Working directory for the agent session |
+| `agents.*.capabilities` | List of capabilities the agent supports |
+| `agents.*.policy` | Permission policy: `ask` (prompt user), `auto` (allow all), `never` (deny all) |
+
+#### Running in ACP mode
+
+Once configured, the CLI automatically routes to the ACP backend:
+
+```bash
+nanobot agent          # Uses ACP if configured
+nanobot gateway        # Gateway also routes to ACP for enabled sessions
+```
+
+#### Session persistence and recovery
+
+ACP sessions persist across restarts. When nanobot restarts, it loads the saved session binding and recovers the ACP session state automatically.
+
+#### Unattended / cron permission policies
+
+For automated runs (heartbeat, cron), set the policy to `auto` to avoid interactive prompts:
+
+```json
+{
+  "acp": {
+    "defaultAgent": "opencode-agent",
+    "agents": {
+      "opencode-agent": {
+        "policy": "auto"
+      }
+    }
+  }
+}
+```
+
+#### Testing with real backend
+
+To run the acceptance tests with a real OpenCode backend:
+
+```bash
+NANOBOT_TEST_OPENCODE=1 uv run pytest tests/acp/test_acceptance_opencode.py -v -m opencode_real
+```
+
+These tests are opt-in to keep the default test suite hermetic.
 
 
 ### Security
