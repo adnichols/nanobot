@@ -67,6 +67,7 @@ class ACPAgentRuntime:
         agent_path: Optional[str] = None,
         session_store: Optional[ACPSessionStore] = None,
         callback_registry: Optional[ACPCallbackRegistry] = None,
+        agent_definition: Optional[Any] = None,
     ):
         """Initialize the ACP agent runtime.
 
@@ -74,10 +75,12 @@ class ACPAgentRuntime:
             agent_path: Path to the ACP agent executable. If None, uses fake mode for testing.
             session_store: Optional session store for persistence.
             callback_registry: Optional callback registry for permission handling.
+            agent_definition: Full agent definition with args, env, cwd, policy, capabilities.
         """
         self._agent_path = agent_path
         self._session_store = session_store
         self._callback_registry = callback_registry
+        self._agent_definition = agent_definition
         self._update_sinks: list[ACPUpdateSink] = []
 
         # Runtime state
@@ -233,21 +236,38 @@ class ACPAgentRuntime:
             }
 
         # Real agent mode - try to spawn the process
-        if self._agent_path and not Path(self._agent_path).exists():
-            raise FileNotFoundError(f"Agent not found at path: {self._agent_path}")
+        agent_path = self._agent_path or "opencode"
+        if not Path(agent_path).exists() and agent_path != "opencode":
+            raise FileNotFoundError(f"Agent not found at path: {agent_path}")
 
         try:
+            cmd = [agent_path]
+            if self._agent_definition and hasattr(self._agent_definition, "args"):
+                cmd.extend(self._agent_definition.args)
+            else:
+                cmd.append("acp")
+
+            # Build env from agent definition merged with current env
+            env = None
+            if self._agent_definition and hasattr(self._agent_definition, "env"):
+                import os
+
+                env = {**os.environ, **self._agent_definition.env}
+
+            # Get cwd from agent definition
+            cwd = None
+            if self._agent_definition and hasattr(self._agent_definition, "cwd"):
+                cwd = self._agent_definition.cwd
+
             # Spawn the agent process using stdio
             self._process = await asyncio.create_subprocess_exec(
-                self._agent_path or "opencode",
-                "acp",
+                *cmd,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=env,
+                cwd=cwd,
             )
-
-            # TODO: Use actual ACP SDK helpers (spawn_agent_process) when available
-            # For now, do basic process initialization
 
             self._initialized = True
             self._current_session_id = request.session_id
@@ -376,14 +396,119 @@ class ACPAgentRuntime:
 
             return [chunk]
 
-        # Real mode - communicate with agent process
+        # Real mode - communicate with agent process via ACP stdio protocol
         if self._process is None or self._process.returncode is not None:
             raise RuntimeError("Agent process has exited")
 
-        # TODO: Implement actual protocol communication
-        # Using ACP SDK helpers when available
+        request_id = str(uuid.uuid4())
 
-        raise RuntimeError("Real agent mode not fully implemented")
+        await self._emit_update(
+            ACPUpdateEvent(
+                event_type="prompt_start",
+                timestamp=datetime.now(UTC),
+                payload={"content": request.content, "session_id": request.session_id},
+                correlation_id=request_id,
+            )
+        )
+
+        # Build ACP prompt message
+        import json
+
+        prompt_message = {
+            "type": "prompt",
+            "session_id": request.session_id,
+            "content": request.content,
+            "request_id": request_id,
+        }
+
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            self._active_prompts[request.session_id] = current_task
+
+        if self._process.stdin is None:
+            raise RuntimeError("Agent process stdin is not available")
+
+        if self._process.stdout is None:
+            raise RuntimeError("Agent process stdout is not available")
+
+        try:
+            message_bytes = (json.dumps(prompt_message) + "\n").encode("utf-8")
+            self._process.stdin.write(message_bytes)
+            await self._process.stdin.drain()
+        except Exception as e:
+            raise RuntimeError(f"Failed to send prompt to agent: {e}") from e
+
+        chunks: list[ACPStreamChunk] = []
+        try:
+            while True:
+                line = await self._process.stdout.readline()
+                if not line:
+                    break
+
+                try:
+                    response = json.loads(line.decode("utf-8"))
+                except json.JSONDecodeError:
+                    continue
+
+                response_type = response.get("type", "")
+
+                if response_type == "content_delta":
+                    chunk = ACPStreamChunk(
+                        type=ACPStreamChunkType.CONTENT_DELTA,
+                        content=response.get("content", ""),
+                    )
+                    chunks.append(chunk)
+                    for sink in self._update_sinks:
+                        await sink.stream_chunk(chunk)
+
+                elif response_type == "tool_call":
+                    tool_data = response.get("tool_call", {})
+                    chunk = ACPStreamChunk(
+                        type=ACPStreamChunkType.TOOL_USE_START,
+                        tool_name=tool_data.get("name"),
+                        tool_input=tool_data.get("input"),
+                    )
+                    chunks.append(chunk)
+                    for sink in self._update_sinks:
+                        await sink.stream_chunk(chunk)
+
+                elif response_type == "error":
+                    error_chunk = ACPStreamChunk(
+                        type=ACPStreamChunkType.ERROR,
+                        content=response.get("message", "Unknown error"),
+                        error=response.get("error"),
+                    )
+                    chunks.append(error_chunk)
+                    for sink in self._update_sinks:
+                        await sink.stream_chunk(error_chunk)
+                    break
+
+                elif response_type == "done":
+                    break
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            error_chunk = ACPStreamChunk(
+                type=ACPStreamChunkType.ERROR,
+                content=f"Error reading agent response: {e}",
+            )
+            chunks.append(error_chunk)
+            for sink in self._update_sinks:
+                await sink.stream_chunk(error_chunk)
+        finally:
+            if self._active_prompts.get(request.session_id) is current_task:
+                self._active_prompts.pop(request.session_id, None)
+
+        await self._emit_update(
+            ACPUpdateEvent(
+                event_type="prompt_end",
+                timestamp=datetime.now(UTC),
+                payload={"session_id": request.session_id, "chunks": len(chunks)},
+                correlation_id=request_id,
+            )
+        )
+
+        return chunks
 
     async def cancel(self, request: ACPCancelRequest) -> None:
         """Cancel an ongoing prompt operation.
@@ -391,6 +516,20 @@ class ACPAgentRuntime:
         Args:
             request: Cancel request with session ID and optional operation ID.
         """
+        if self._process and self._process.returncode is None and self._process.stdin is not None:
+            import json
+
+            cancel_message = {
+                "type": "cancel",
+                "session_id": request.session_id,
+                "operation_id": request.operation_id,
+            }
+            try:
+                self._process.stdin.write((json.dumps(cancel_message) + "\n").encode("utf-8"))
+                await self._process.stdin.drain()
+            except Exception:
+                pass
+
         # Cancel any active prompt for this session
         if request.session_id in self._active_prompts:
             task = self._active_prompts.pop(request.session_id)

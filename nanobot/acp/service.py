@@ -25,6 +25,7 @@ class ACPServiceConfig:
     agent_path: Optional[str] = None
     storage_dir: Optional[Path] = None
     callback_registry: Optional[ACPCallbackRegistry] = None
+    agent_definition: Optional[Any] = None  # ACPAgentDefinition from config.schema
 
 
 class ACPService:
@@ -66,11 +67,12 @@ class ACPService:
         Returns:
             Dict containing session information.
         """
-        # Create a new client for this session
+        # Create a new client for this session with full agent definition
         client = ACPClient(
             agent_path=self._config.agent_path,
             session_store=self._session_store,
             callback_registry=self._config.callback_registry,
+            agent_definition=self._config.agent_definition,
         )
 
         # Initialize and create session
@@ -78,6 +80,8 @@ class ACPService:
         result = await client.create_session()
 
         acp_session_id = result.get("session_id")
+        if not isinstance(acp_session_id, str) or not acp_session_id:
+            raise RuntimeError("ACP session creation did not return a session_id")
 
         # Store the binding
         if self._binding_store:
@@ -123,6 +127,7 @@ class ACPService:
             agent_path=self._config.agent_path,
             session_store=self._session_store,
             callback_registry=self._config.callback_registry,
+            agent_definition=self._config.agent_definition,
         )
 
         await client.initialize()

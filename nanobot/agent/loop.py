@@ -193,6 +193,8 @@ class AgentLoop:
         session_key: str,
         message: str,
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        channel: str | None = None,
+        chat_id: str | None = None,
     ) -> OutboundMessage | None:
         """Route a message to the ACP backend instead of local agent.
 
@@ -205,11 +207,18 @@ class AgentLoop:
             session_key: The nanobot session key
             message: The message content
             on_progress: Optional callback for progress updates
+            channel: Source channel (e.g., 'telegram', 'whatsapp', 'cli')
+            chat_id: Source chat ID to preserve routing
 
         Returns:
             OutboundMessage with the response content
         """
         from nanobot.bus.events import OutboundMessage
+
+        if channel is None or chat_id is None:
+            channel, chat_id = (
+                session_key.split(":", 1) if ":" in session_key else ("cli", "direct")
+            )
 
         try:
             # Load or create ACP session for this nanobot session
@@ -234,15 +243,15 @@ class AgentLoop:
                 response = "ACP session completed."
 
             return OutboundMessage(
-                channel="cli",
-                chat_id="direct",
+                channel=channel,
+                chat_id=chat_id,
                 content=response,
             )
         except Exception as e:
             logger.exception("Error routing to ACP for session {}", session_key)
             return OutboundMessage(
-                channel="cli",
-                chat_id="direct",
+                channel=channel,
+                chat_id=chat_id,
                 content=f"ACP error: {str(e)[:200]}",
             )
 
@@ -376,14 +385,23 @@ class AgentLoop:
 
     async def _handle_stop(self, msg: InboundMessage) -> None:
         """Cancel all active tasks and subagents for the session."""
-        tasks = self._active_tasks.pop(msg.session_key, [])
-        cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
-        for t in tasks:
+        session_key = msg.session_key
+
+        if self.acp_service:
             try:
-                await t
+                await self.acp_service.cancel_operation(session_key)
+            except Exception:
+                logger.exception("Error cancelling ACP operation for session {}", session_key)
+
+        tasks = self._active_tasks.pop(session_key, [])
+        cancelled = sum(1 for task in tasks if not task.done() and task.cancel())
+        for task in tasks:
+            try:
+                await task
             except (asyncio.CancelledError, Exception):
                 pass
-        sub_cancelled = await self.subagents.cancel_by_session(msg.session_key)
+
+        sub_cancelled = await self.subagents.cancel_by_session(session_key)
         total = cancelled + sub_cancelled
         content = f"⏹ Stopped {total} task(s)." if total else "No active task to stop."
         await self.bus.publish_outbound(
@@ -499,7 +517,7 @@ class AgentLoop:
                     )
 
             # Route to ACP backend
-            return await self._route_to_acp(key, msg.content, on_progress)
+            return await self._route_to_acp(key, msg.content, on_progress, msg.channel, msg.chat_id)
 
         session = self.sessions.get_or_create(key)
 
