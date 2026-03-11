@@ -47,7 +47,39 @@ jobs:
         shell: bash
         run: python3 -m pip install packaging
 
+      - name: Check PyPI release availability
+        id: pypi
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_VERSION: ${{ steps.target.outputs.version }}
+        run: |
+          if [ "$EVENT_NAME" != "release" ] || [ -z "$RELEASE_VERSION" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          version = os.environ["RELEASE_VERSION"].removeprefix("v")
+          url = f"https://pypi.org/pypi/nanobot-ai/{version}/json"
+
+          try:
+              with urllib.request.urlopen(url, timeout=30):
+                  print("available=true")
+          except urllib.error.HTTPError as exc:
+              if exc.code == 404:
+                  print("available=false")
+              else:
+                  raise
+          PY
+
       - name: Regenerate Homebrew formula
+        if: steps.pypi.outputs.available == 'true'
         shell: bash
         run: |
           if [ -n "${{ steps.target.outputs.version }}" ]; then
@@ -57,6 +89,7 @@ jobs:
           fi
 
       - name: Preserve generated formula
+        if: steps.pypi.outputs.available == 'true'
         shell: bash
         run: cp Formula/nanobot.rb "$RUNNER_TEMP/nanobot.rb"
 
@@ -110,12 +143,12 @@ jobs:
           PY
 
       - name: Restore generated formula
-        if: steps.refresh.outputs.update == 'true'
+        if: steps.pypi.outputs.available == 'true' && steps.refresh.outputs.update == 'true'
         shell: bash
         run: cp "$RUNNER_TEMP/nanobot.rb" Formula/nanobot.rb
 
       - name: Commit formula refresh
-        if: steps.refresh.outputs.update == 'true'
+        if: steps.pypi.outputs.available == 'true' && steps.refresh.outputs.update == 'true'
         shell: bash
         run: |
           if git diff --quiet -- Formula/nanobot.rb; then
@@ -131,3 +164,10 @@ jobs:
           git add Formula/nanobot.rb
           git commit -m "Update Homebrew formula for ${version#v}"
           git push origin "HEAD:${{ steps.target.outputs.commit_ref }}"
+
+      - name: Note pending formula refresh
+        if: steps.pypi.outputs.available != 'true'
+        shell: bash
+        run: |
+          echo "PyPI artifact for ${{ steps.target.outputs.version }} is not available yet."
+          echo "Homebrew formula refresh skipped; rerun this workflow after publishing nanobot-ai to PyPI."
