@@ -45,7 +45,7 @@ class AgentLoop:
     """
 
     _TOOL_RESULT_MAX_CHARS = 500
-    _ACP_ROUTE_TIMEOUT_SECONDS = 5.0
+    _ACP_ROUTE_TIMEOUT_SECONDS = 60.0
 
     def __init__(
         self,
@@ -443,13 +443,19 @@ class AgentLoop:
                 )
 
     async def close_mcp(self) -> None:
-        """Close MCP connections."""
+        """Close MCP and ACP connections."""
         if self._mcp_stack:
             try:
                 await self._mcp_stack.aclose()
             except (RuntimeError, BaseExceptionGroup):
                 pass  # MCP SDK cancel scope cleanup is noisy but harmless
             self._mcp_stack = None
+
+        if self.acp_service:
+            try:
+                await self.acp_service.shutdown()
+            except Exception:
+                logger.exception("Error shutting down ACP service")
 
     def stop(self) -> None:
         """Stop the agent loop."""

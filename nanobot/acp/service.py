@@ -13,6 +13,7 @@ from typing import Any, Optional
 from nanobot.acp.interfaces import ACPCallbackRegistry, ACPSessionStore, ACPUpdateSink
 from nanobot.acp.sdk_client import SDKClient, SDKError
 from nanobot.acp.store import ACPSessionBindingStore
+from nanobot.acp.types import ACPStreamChunk
 
 
 @dataclass
@@ -21,6 +22,7 @@ class ACPServiceConfig:
 
     agent_path: Optional[str] = None
     storage_dir: Optional[Path] = None
+    workspace_dir: Optional[Path] = None
     callback_registry: Optional[ACPCallbackRegistry] = None
     agent_definition: Optional[Any] = None  # ACPAgentDefinition from config.schema
 
@@ -60,18 +62,27 @@ class ACPService:
         """
         # Extract args, env, cwd from agent_definition if provided
         agent_def = self._config.agent_definition
+        model = getattr(agent_def, "model", None) or None
         args = getattr(agent_def, "args", None) or []
         env = getattr(agent_def, "env", None) or None
         cwd = getattr(agent_def, "cwd", None) or None
+        if cwd is None and self._config.workspace_dir is not None:
+            cwd = str(self._config.workspace_dir)
 
         return SDKClient(
             agent_path=self._config.agent_path,
+            model=model,
             args=args if args else None,
             env=env,
             cwd=cwd,
             session_store=self._session_store,
             callback_registry=self._config.callback_registry,
         )
+
+    async def _apply_session_overrides(self, client: SDKClient, session_id: str) -> None:
+        """Apply configured ACP session overrides after create/load."""
+        if client.model:
+            await client.set_model(client.model, session_id=session_id)
 
     async def create_session(
         self,
@@ -97,6 +108,8 @@ class ACPService:
         acp_session_id = result.get("session_id")
         if not isinstance(acp_session_id, str) or not acp_session_id:
             raise RuntimeError("ACP session creation did not return a session_id")
+
+        await self._apply_session_overrides(client, acp_session_id)
 
         # Cache capabilities for this agent
         if client.capabilities:
@@ -162,11 +175,13 @@ class ACPService:
                 result = await client.load_session(binding.acp_session_id)
                 acp_session_id = binding.acp_session_id
                 status = "loaded"
+                await self._apply_session_overrides(client, acp_session_id)
             except SDKError:
                 # Load failed - fallback to creating new session
                 result = await client.new_session()
                 acp_session_id = result.get("session_id", "")
                 status = "created"
+                await self._apply_session_overrides(client, acp_session_id)
                 # Rebind the new session
                 if self._binding_store:
                     from nanobot.acp.store import ACPSessionBinding
@@ -182,6 +197,7 @@ class ACPService:
             result = await client.new_session()
             acp_session_id = result.get("session_id", "")
             status = "created"
+            await self._apply_session_overrides(client, acp_session_id)
             # Rebind the new session
             if self._binding_store:
                 from nanobot.acp.store import ACPSessionBinding
@@ -208,7 +224,7 @@ class ACPService:
         self,
         nanobot_session_key: str,
         message: str,
-    ) -> list[dict[str, Any]]:
+    ) -> list[ACPStreamChunk]:
         """Process an incoming chat message through ACP.
 
         Args:

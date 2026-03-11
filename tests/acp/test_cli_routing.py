@@ -47,6 +47,7 @@ def config_with_acp():
     config.acp.agents["opencode"] = ACPAgentDefinition(
         id="opencode",
         command="opencode",
+        model="openai/gpt-5.4",
         args=["acp"],
         policy="auto",
     )
@@ -101,6 +102,7 @@ class TestAgentDefinitionPropagation:
         agent_config = ACPAgentDefinition(
             id="opencode",
             command="opencode",
+            model="openai/gpt-5.4",
             args=["acp", "--verbose"],
             env={"OPENCODE_API_KEY": "secret123"},
             cwd="/workspace/myproject",
@@ -136,6 +138,7 @@ class TestAgentDefinitionPropagation:
             assert passed_config.agent_path == "opencode"
             assert passed_config.agent_definition is agent_config
             assert passed_config.agent_definition.args == ["acp", "--verbose"]
+            assert passed_config.agent_definition.model == "openai/gpt-5.4"
             assert passed_config.agent_definition.env == {"OPENCODE_API_KEY": "secret123"}
             assert passed_config.agent_definition.cwd == "/workspace/myproject"
             assert passed_config.agent_definition.policy == "auto"
@@ -187,6 +190,29 @@ def test_acp_service_can_be_created():
     assert service is not None
 
 
+def test_acp_service_uses_workspace_dir_when_agent_cwd_missing():
+    """ACP sessions should default to the configured workspace when agent cwd is unset."""
+    from nanobot.acp.service import ACPService, ACPServiceConfig
+
+    agent_definition = ACPAgentDefinition(
+        id="opencode",
+        command="opencode",
+        args=["acp"],
+    )
+    service = ACPService(
+        ACPServiceConfig(
+            agent_path="opencode",
+            workspace_dir=Path("/workspace/from-config"),
+            agent_definition=agent_definition,
+        )
+    )
+
+    with patch("nanobot.acp.service.SDKClient") as mock_client_cls:
+        service._create_client()
+
+    assert mock_client_cls.call_args.kwargs["cwd"] == "/workspace/from-config"
+
+
 @pytest.mark.asyncio
 async def test_load_session_preserves_agent_definition_on_resume():
     """Given a resumed ACP session, load_session should recreate the client with full agent config."""
@@ -195,6 +221,7 @@ async def test_load_session_preserves_agent_definition_on_resume():
     agent_definition = ACPAgentDefinition(
         id="opencode",
         command="opencode",
+        model="openai/gpt-5.4",
         args=["acp", "--verbose"],
         env={"OPENCODE_API_KEY": "secret123"},
         cwd="/workspace/myproject",
@@ -208,22 +235,85 @@ async def test_load_session_preserves_agent_definition_on_resume():
 
     with patch("nanobot.acp.service.SDKClient") as mock_client_cls:
         client = MagicMock()
-        client.initialize = AsyncMock(return_value={"status": "initialized", "capabilities": {}})
-        client.capabilities = {}
+        client.initialize = AsyncMock(
+            return_value={"status": "initialized", "capabilities": {"loadSession": True}}
+        )
+        client.capabilities = {"loadSession": True}
+        client.model = "openai/gpt-5.4"
         client.load_session = AsyncMock(
             return_value={"session": {"id": "sess-123"}, "status": "loaded"}
         )
         client.new_session = AsyncMock(
             return_value={"session_id": "new-session", "status": "created"}
         )
+        client.set_model = AsyncMock()
         mock_client_cls.return_value = client
 
         await service.load_session("cli:direct")
 
     # Verify that args, env, cwd are extracted from agent_definition and passed to SDKClient
+    assert mock_client_cls.call_args.kwargs["model"] == "openai/gpt-5.4"
     assert mock_client_cls.call_args.kwargs["args"] == ["acp", "--verbose"]
     assert mock_client_cls.call_args.kwargs["env"] == {"OPENCODE_API_KEY": "secret123"}
     assert mock_client_cls.call_args.kwargs["cwd"] == "/workspace/myproject"
+    client.set_model.assert_awaited_once_with("openai/gpt-5.4", session_id="sess-123")
+
+
+@pytest.mark.asyncio
+async def test_close_mcp_shuts_down_acp_service():
+    """AgentLoop cleanup should close both MCP and ACP resources."""
+    from nanobot.agent.loop import AgentLoop
+
+    bus = MagicMock()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    acp_service = MagicMock()
+    acp_service.shutdown = AsyncMock()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        agent = AgentLoop(
+            bus=bus,
+            provider=provider,
+            workspace=Path(tmpdir),
+            acp_service=acp_service,
+            acp_default_agent="opencode",
+        )
+        mcp_stack = MagicMock()
+        mcp_stack.aclose = AsyncMock()
+        agent._mcp_stack = mcp_stack
+
+        await agent.close_mcp()
+
+    mcp_stack.aclose.assert_awaited_once()
+    acp_service.shutdown.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_create_session_applies_configured_model_override():
+    """Given an ACP agent model override, create_session should apply it before prompting."""
+    from nanobot.acp.service import ACPService, ACPServiceConfig
+
+    agent_definition = ACPAgentDefinition(
+        id="opencode",
+        command="opencode",
+        model="openai/gpt-5.4",
+        args=["acp"],
+    )
+    service = ACPService(ACPServiceConfig(agent_path="opencode", agent_definition=agent_definition))
+
+    with patch("nanobot.acp.service.SDKClient") as mock_client_cls:
+        client = MagicMock()
+        client.initialize = AsyncMock(return_value={"status": "initialized", "capabilities": {}})
+        client.new_session = AsyncMock(return_value={"session_id": "sess-123", "status": "created"})
+        client.set_model = AsyncMock()
+        client.capabilities = {}
+        client.model = "openai/gpt-5.4"
+        mock_client_cls.return_value = client
+
+        result = await service.create_session("cli:direct")
+
+    assert result["acp_session_id"] == "sess-123"
+    client.set_model.assert_awaited_once_with("openai/gpt-5.4", session_id="sess-123")
 
 
 # ============================================================================
@@ -572,6 +662,35 @@ def test_cli_has_acp_option_in_agent():
     """Given agent command, when checking options, then ACP-related options should be available."""
     result = runner.invoke(app, ["agent", "--help"])
     assert result.exit_code == 0
+
+
+def test_cli_agent_single_message_mode_works_with_logs(tmp_path):
+    """`nanobot agent --logs -m ...` should still initialize AgentLoop and run the prompt."""
+    config = Config()
+    config.agents.defaults.workspace = str(tmp_path / "workspace")
+
+    provider = MagicMock()
+    agent_loop = MagicMock()
+    agent_loop.process_direct = AsyncMock(return_value="CLI_PATH_OK")
+    agent_loop.close_mcp = AsyncMock()
+    agent_loop.channels_config = None
+
+    with (
+        patch("nanobot.config.loader.load_config", return_value=config),
+        patch("nanobot.config.loader.get_data_dir", return_value=tmp_path),
+        patch("nanobot.cli.commands.sync_workspace_templates"),
+        patch("nanobot.cli.commands._make_provider", return_value=provider),
+        patch("nanobot.cli.commands._get_acp_service", return_value=None),
+        patch("nanobot.cron.service.CronService"),
+        patch("nanobot.agent.loop.AgentLoop", return_value=agent_loop) as agent_loop_cls,
+        patch("nanobot.cli.commands._print_agent_response"),
+    ):
+        result = runner.invoke(app, ["agent", "--logs", "-m", "hello"])
+
+    assert result.exit_code == 0
+    agent_loop_cls.assert_called_once()
+    agent_loop.process_direct.assert_awaited_once()
+    agent_loop.close_mcp.assert_awaited_once()
 
 
 # ============================================================================

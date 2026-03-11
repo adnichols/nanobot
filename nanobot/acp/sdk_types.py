@@ -1,140 +1,112 @@
-"""Type conversions between nanobot domain types and SDK schema types.
-
-This module provides functions to convert nanobot's internal domain types
-to the schema types expected by the agent-client-protocol SDK.
-"""
+"""Type conversions between nanobot domain types and ACP wire payloads."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any, Optional
 
-if TYPE_CHECKING:
-    from acp import schema
-
-    from nanobot.acp.types import (
-        ACPInitializeRequest,
-    )
+from nanobot.acp.types import ACPInitializeRequest
 
 
 def to_sdk_initialize_params(
-    request: "ACPInitializeRequest",
-) -> "schema.InitializeRequest":
-    """Convert nanobot's ACPInitializeRequest to SDK InitializeRequest.
+    request: ACPInitializeRequest,
+) -> dict[str, Any]:
+    """Convert nanobot's ACPInitializeRequest to ACP initialize params.
 
     Args:
         request: Nanobot's initialize request.
 
     Returns:
-        SDK schema InitializeRequest ready for sending.
+        ACP wire payload ready for sending.
     """
-    from acp import schema
-
-    # Build client capabilities
-    client_capabilities = schema.ClientCapabilities(
-        fs=None,
-        terminal=False,
-    )
-
-    # Build client info
-    client_info = schema.Implementation(
-        name="nanobot",
-        version="0.1.0",
-    )
-
-    # Build the SDK InitializeRequest
-    return schema.InitializeRequest(
-        protocol_version=1,
-        client_capabilities=client_capabilities,
-        client_info=client_info,
-    )
+    del request
+    return {
+        "protocolVersion": 1,
+        "clientCapabilities": {},
+        "clientInfo": {
+            "name": "nanobot",
+            "version": "0.1.0",
+        },
+    }
 
 
 def to_sdk_new_session_params(
-    session_id: str,
-) -> "schema.NewSessionRequest":
-    """Convert session ID to SDK NewSessionRequest.
+    cwd: str,
+) -> dict[str, Any]:
+    """Convert cwd to ACP session/new params.
 
     Args:
-        session_id: The session ID to create.
+        cwd: Working directory for the ACP session.
 
     Returns:
-        SDK schema NewSessionRequest ready for sending.
+        ACP wire payload ready for sending.
     """
-    from acp import schema
-
-    # NewSessionRequest expects cwd and mcp_servers
-    return schema.NewSessionRequest(
-        cwd="",
-        mcp_servers=[],
-    )
+    return {
+        "cwd": cwd,
+        "mcpServers": [],
+    }
 
 
 def to_sdk_prompt_params(
     content: str,
     session_id: str,
-) -> "schema.PromptRequest":
-    """Convert nanobot's prompt request to SDK PromptRequest.
+) -> dict[str, Any]:
+    """Convert nanobot's prompt request to ACP session/prompt params.
 
     Args:
         content: The prompt content.
         session_id: The session ID to send the prompt to.
 
     Returns:
-        SDK schema PromptRequest ready for sending.
+        ACP wire payload ready for sending.
     """
-    from acp import schema
-
-    # Build the prompt with text content
-    prompt = [
-        schema.TextContentBlock(
-            type="text",
-            text=content,
-        )
-    ]
-
-    return schema.PromptRequest(
-        session_id=session_id,
-        prompt=prompt,
-    )
+    return {
+        "sessionId": session_id,
+        "prompt": [
+            {
+                "type": "text",
+                "text": content,
+            }
+        ],
+    }
 
 
 def to_sdk_load_session_params(
     session_id: str,
-) -> "schema.LoadSessionRequest":
-    """Convert session ID to SDK LoadSessionRequest.
+    cwd: str,
+) -> dict[str, Any]:
+    """Convert session ID to ACP session/load params.
 
     Args:
         session_id: The session ID to load.
+        cwd: Working directory for the ACP session.
 
     Returns:
-        SDK schema LoadSessionRequest ready for sending.
+        ACP wire payload ready for sending.
     """
-    from acp import schema
-
-    return schema.LoadSessionRequest(
-        session_id=session_id,
-    )
+    return {
+        "sessionId": session_id,
+        "cwd": cwd,
+        "mcpServers": [],
+    }
 
 
 def to_sdk_cancel_params(
     session_id: str,
     request_id: Optional[str | int] = None,
-) -> "schema.CancelRequestNotification":
-    """Convert nanobot's cancel request to SDK CancelRequestNotification.
+) -> dict[str, Any]:
+    """Convert nanobot's cancel request to ACP session/cancel params.
 
     Args:
         session_id: The session ID to cancel.
         request_id: Optional request ID to cancel specific operation.
 
     Returns:
-        SDK schema CancelRequestNotification ready for sending.
+        ACP wire payload ready for sending.
     """
-    from acp import schema
-
-    return schema.CancelRequestNotification(
-        session_id=session_id,
-        requestId=request_id,
-    )
+    params: dict[str, Any] = {"sessionId": session_id}
+    if request_id is not None:
+        params["requestId"] = request_id
+    return params
 
 
 def from_sdk_initialize_response(response: Any) -> dict[str, Any]:
@@ -148,14 +120,19 @@ def from_sdk_initialize_response(response: Any) -> dict[str, Any]:
     """
     result: dict[str, Any] = {}
 
-    if hasattr(response, "protocol_version"):
-        result["protocol_version"] = response.protocol_version
+    data = _as_dict(response)
 
-    if hasattr(response, "agent_info"):
-        result["agent_info"] = _extract_agent_info(response.agent_info)
+    protocol_version = _first(data, "protocol_version", "protocolVersion")
+    if protocol_version is not None:
+        result["protocol_version"] = protocol_version
 
-    if hasattr(response, "capabilities"):
-        result["capabilities"] = _extract_capabilities(response.capabilities)
+    agent_info = _first(data, "agent_info", "agentInfo")
+    if agent_info is not None:
+        result["agent_info"] = _extract_agent_info(agent_info)
+
+    capabilities = _first(data, "capabilities", "agentCapabilities")
+    if capabilities is not None:
+        result["capabilities"] = _extract_capabilities(capabilities)
 
     return result
 
@@ -171,11 +148,15 @@ def from_sdk_session_response(response: Any) -> dict[str, Any]:
     """
     result: dict[str, Any] = {}
 
-    if hasattr(response, "session_id"):
-        result["session_id"] = response.session_id
+    data = _as_dict(response)
 
-    if hasattr(response, "session"):
-        result["session"] = _extract_session_data(response.session)
+    session_id = _first(data, "session_id", "sessionId", "sessionID")
+    if session_id is not None:
+        result["session_id"] = session_id
+
+    session = _first(data, "session")
+    if session is not None:
+        result["session"] = _extract_session_data(session)
 
     return result
 
@@ -191,20 +172,37 @@ def from_sdk_prompt_chunk(chunk: Any) -> dict[str, Any]:
     """
     result: dict[str, Any] = {}
 
-    # Handle different chunk types from SDK
-    if hasattr(chunk, "session_id"):
-        result["session_id"] = chunk.session_id
+    data = _as_dict(chunk)
 
-    if hasattr(chunk, "message"):
-        result["message"] = _extract_message_chunk(chunk.message)
+    session_id = _first(data, "session_id", "sessionId")
+    if session_id is not None:
+        result["session_id"] = session_id
 
-    if hasattr(chunk, "usage"):
-        result["usage"] = _extract_usage(chunk.usage)
+    message = _first(data, "message")
+    if message is not None:
+        result["message"] = _extract_message_chunk(message)
+        content = _message_text(result["message"])
+        if content:
+            result["content"] = content
+
+    content = _first(data, "content")
+    if isinstance(content, str) and content:
+        result["content"] = content
+
+    usage = _first(data, "usage")
+    if usage is not None:
+        result["usage"] = _extract_usage(usage)
+
+    stop_reason = _first(data, "stop_reason", "stopReason")
+    if stop_reason is not None:
+        result["stop_reason"] = stop_reason
 
     return result
 
 
-def from_sdk_notification(notification: Any) -> tuple[str, dict[str, Any]]:
+def from_sdk_notification(
+    notification: Any, params: Any | None = None
+) -> tuple[str, dict[str, Any]]:
     """Convert SDK notification to method and params for routing.
 
     Args:
@@ -213,17 +211,22 @@ def from_sdk_notification(notification: Any) -> tuple[str, dict[str, Any]]:
     Returns:
         Tuple of (method, params dict) for routing to appropriate handler.
     """
-    method = getattr(notification, "method", "unknown")
-    params = getattr(notification, "params", {})
+    if params is None:
+        data = _as_dict(notification)
+        method = str(_first(data, "method") or "unknown")
+        raw_params = _first(data, "params") or {}
+    else:
+        method = str(notification)
+        raw_params = params
 
-    # Extract params into dict
-    params_dict: dict[str, Any] = {}
+    params_dict = _as_dict(raw_params)
+    session_id = _first(params_dict, "session_id", "sessionId")
+    if session_id is not None:
+        params_dict["session_id"] = session_id
 
-    if hasattr(params, "session_id"):
-        params_dict["session_id"] = params.session_id
-
-    if hasattr(params, "update"):
-        params_dict["update"] = _extract_update(params.update)
+    update = _first(params_dict, "update")
+    if update is not None:
+        params_dict["update"] = _extract_update(update)
 
     return (method, params_dict)
 
@@ -233,9 +236,10 @@ def _extract_agent_info(agent_info: Any) -> dict[str, Any]:
     if agent_info is None:
         return {}
 
+    data = _as_dict(agent_info)
     return {
-        "name": getattr(agent_info, "name", "unknown"),
-        "version": getattr(agent_info, "version", "unknown"),
+        "name": _first(data, "name") or "unknown",
+        "version": _first(data, "version") or "unknown",
     }
 
 
@@ -246,17 +250,31 @@ def _extract_capabilities(capabilities: Any) -> dict[str, Any]:
 
     result: dict[str, Any] = {}
 
-    # Common capabilities
-    if hasattr(capabilities, "load_session"):
-        result["loadSession"] = capabilities.load_session
-    if hasattr(capabilities, "supports_streaming"):
-        result["supports_streaming"] = capabilities.supports_streaming
-    if hasattr(capabilities, "tools"):
-        result["tools"] = capabilities.tools or []
-    if hasattr(capabilities, "prompts"):
-        result["prompts"] = capabilities.prompts
-    if hasattr(capabilities, "resources"):
-        result["resources"] = capabilities.resources
+    data = _as_dict(capabilities)
+
+    load_session = _first(data, "load_session", "loadSession")
+    if load_session is not None:
+        result["loadSession"] = load_session
+
+    supports_streaming = _first(data, "supports_streaming", "supportsStreaming")
+    if supports_streaming is not None:
+        result["supports_streaming"] = supports_streaming
+
+    tools = _first(data, "tools")
+    if tools is not None:
+        result["tools"] = tools
+
+    prompts = _first(data, "prompts", "promptCapabilities")
+    if prompts is not None:
+        result["prompts"] = prompts
+
+    resources = _first(data, "resources", "mcpCapabilities")
+    if resources is not None:
+        result["resources"] = resources
+
+    session_capabilities = _first(data, "sessionCapabilities")
+    if session_capabilities is not None:
+        result["sessionCapabilities"] = session_capabilities
 
     return result
 
@@ -268,12 +286,19 @@ def _extract_session_data(session: Any) -> dict[str, Any]:
 
     result: dict[str, Any] = {}
 
-    if hasattr(session, "id"):
-        result["id"] = session.id
-    if hasattr(session, "state"):
-        result["state"] = session.state or {}
-    if hasattr(session, "history"):
-        result["history"] = session.history or []
+    data = _as_dict(session)
+
+    session_id = _first(data, "id", "sessionId")
+    if session_id is not None:
+        result["id"] = session_id
+
+    state = _first(data, "state")
+    if state is not None:
+        result["state"] = state
+
+    history = _first(data, "history", "messages")
+    if history is not None:
+        result["history"] = history
 
     return result
 
@@ -285,10 +310,15 @@ def _extract_message_chunk(message: Any) -> dict[str, Any]:
 
     result: dict[str, Any] = {}
 
-    if hasattr(message, "role"):
-        result["role"] = message.role
-    if hasattr(message, "content"):
-        result["content"] = _extract_content(message.content)
+    data = _as_dict(message)
+
+    role = _first(data, "role")
+    if role is not None:
+        result["role"] = role
+
+    content = _first(data, "content")
+    if content is not None:
+        result["content"] = _extract_content(content)
 
     return result
 
@@ -301,15 +331,20 @@ def _extract_content(content: Any) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
 
     for block in content:
+        block_data = _as_dict(block)
         block_dict: dict[str, Any] = {}
-        if hasattr(block, "type"):
-            block_dict["type"] = block.type
-        if hasattr(block, "text"):
-            block_dict["text"] = block.text
-        if hasattr(block, "tool_use"):
-            block_dict["tool_use"] = _extract_tool_use(block.tool_use)
-        if hasattr(block, "tool_result"):
-            block_dict["tool_result"] = _extract_tool_result(block.tool_result)
+        block_type = _first(block_data, "type")
+        if block_type is not None:
+            block_dict["type"] = block_type
+        text = _first(block_data, "text")
+        if text is not None:
+            block_dict["text"] = text
+        tool_use = _first(block_data, "tool_use", "toolUse")
+        if tool_use is not None:
+            block_dict["tool_use"] = _extract_tool_use(tool_use)
+        tool_result = _first(block_data, "tool_result", "toolResult")
+        if tool_result is not None:
+            block_dict["tool_result"] = _extract_tool_result(tool_result)
         result.append(block_dict)
 
     return result
@@ -320,10 +355,11 @@ def _extract_tool_use(tool_use: Any) -> dict[str, Any]:
     if tool_use is None:
         return {}
 
+    data = _as_dict(tool_use)
     return {
-        "id": getattr(tool_use, "id", None),
-        "name": getattr(tool_use, "name", None),
-        "input": getattr(tool_use, "input", {}),
+        "id": _first(data, "id"),
+        "name": _first(data, "name"),
+        "input": _first(data, "input") or {},
     }
 
 
@@ -332,9 +368,10 @@ def _extract_tool_result(tool_result: Any) -> dict[str, Any]:
     if tool_result is None:
         return {}
 
+    data = _as_dict(tool_result)
     return {
-        "tool_use_id": getattr(tool_result, "tool_use_id", None),
-        "content": getattr(tool_result, "content", None),
+        "tool_use_id": _first(data, "tool_use_id", "toolUseId"),
+        "content": _first(data, "content"),
     }
 
 
@@ -343,10 +380,11 @@ def _extract_usage(usage: Any) -> dict[str, Any]:
     if usage is None:
         return {}
 
+    data = _as_dict(usage)
     return {
-        "input_tokens": getattr(usage, "input_tokens", 0),
-        "output_tokens": getattr(usage, "output_tokens", 0),
-        "total_tokens": getattr(usage, "total_tokens", 0),
+        "input_tokens": _first(data, "input_tokens", "inputTokens") or 0,
+        "output_tokens": _first(data, "output_tokens", "outputTokens") or 0,
+        "total_tokens": _first(data, "total_tokens", "totalTokens") or 0,
     }
 
 
@@ -357,8 +395,27 @@ def _extract_update(update: Any) -> dict[str, Any]:
 
     result: dict[str, Any] = {}
 
-    if hasattr(update, "session_update"):
-        result["session_update"] = _extract_session_update(update.session_update)
+    data = _as_dict(update)
+
+    session_update = _first(data, "session_update", "sessionUpdate")
+    if session_update is not None:
+        result["session_update"] = _extract_session_update(session_update)
+
+    for key in (
+        "availableCommands",
+        "used",
+        "size",
+        "cost",
+        "content",
+        "message",
+        "toolCall",
+        "toolResult",
+        "thought",
+        "usage",
+    ):
+        value = _first(data, key)
+        if value is not None:
+            result[key] = value
 
     return result
 
@@ -370,15 +427,65 @@ def _extract_session_update(session_update: Any) -> dict[str, Any]:
 
     result: dict[str, Any] = {}
 
-    if hasattr(session_update, "thought"):
-        result["thought"] = session_update.thought
-    if hasattr(session_update, "message"):
-        result["message"] = _extract_message_chunk(session_update.message)
-    if hasattr(session_update, "tool_call"):
-        result["tool_call"] = session_update.tool_call
-    if hasattr(session_update, "tool_result"):
-        result["tool_result"] = session_update.tool_result
-    if hasattr(session_update, "usage"):
-        result["usage"] = _extract_usage(session_update.usage)
+    if isinstance(session_update, str):
+        result["kind"] = session_update
+        return result
+
+    data = _as_dict(session_update)
+
+    thought = _first(data, "thought")
+    if thought is not None:
+        result["thought"] = thought
+
+    message = _first(data, "message")
+    if message is not None:
+        result["message"] = _extract_message_chunk(message)
+
+    tool_call = _first(data, "tool_call", "toolCall")
+    if tool_call is not None:
+        result["tool_call"] = tool_call
+
+    tool_result = _first(data, "tool_result", "toolResult")
+    if tool_result is not None:
+        result["tool_result"] = tool_result
+
+    usage = _first(data, "usage")
+    if usage is not None:
+        result["usage"] = _extract_usage(usage)
 
     return result
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    """Normalize Pydantic models and objects to dicts when possible."""
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "model_dump"):
+        return value.model_dump(by_alias=True, exclude_none=True)
+    if hasattr(value, "__dict__"):
+        return {
+            key: item
+            for key, item in vars(value).items()
+            if not key.startswith("_") and item is not None
+        }
+    return {}
+
+
+def _first(data: dict[str, Any], *keys: str) -> Any:
+    """Return the first present key from a normalized dict."""
+    for key in keys:
+        if key in data:
+            return data[key]
+    return None
+
+
+def _message_text(message: dict[str, Any]) -> str:
+    """Extract plain text from a normalized message payload."""
+    parts: list[str] = []
+    for block in message.get("content", []):
+        text = block.get("text")
+        if isinstance(text, str) and text:
+            parts.append(text)
+    return "".join(parts)

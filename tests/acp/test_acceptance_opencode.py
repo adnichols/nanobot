@@ -112,7 +112,7 @@ class TestRealPromptRoundTrip:
 
         # Verify we got a response
         assert len(chunks) > 0
-        assert chunks[0].get("content") is not None
+        assert chunks[0].content is not None
 
 
 # =============================================================================

@@ -35,19 +35,22 @@ class TestSDKTypesConversions:
 
         params = to_sdk_initialize_params(request)
 
-        assert params is not None
-        # Check that params has the expected SDK schema fields
-        assert hasattr(params, "protocol_version") or "protocol_version" in params
+        assert params == {
+            "protocolVersion": 1,
+            "clientCapabilities": {},
+            "clientInfo": {"name": "nanobot", "version": "0.1.0"},
+        }
 
     def test_to_sdk_new_session_params(self):
         """Test new session params conversion."""
         from nanobot.acp.sdk_types import to_sdk_new_session_params
 
-        params = to_sdk_new_session_params("test-session-id")
+        params = to_sdk_new_session_params("/workspace/project")
 
-        assert params is not None
-        # Should have cwd and mcp_servers fields (NewSessionRequest schema)
-        assert hasattr(params, "cwd")
+        assert params == {
+            "cwd": "/workspace/project",
+            "mcpServers": [],
+        }
 
     def test_to_sdk_prompt_params(self):
         """Test prompt params conversion."""
@@ -55,9 +58,22 @@ class TestSDKTypesConversions:
 
         params = to_sdk_prompt_params(content="Hello, world!", session_id="test-session-id")
 
-        assert params is not None
-        assert hasattr(params, "prompt") or "prompt" in params.model_dump()
-        assert hasattr(params, "session_id")
+        assert params == {
+            "sessionId": "test-session-id",
+            "prompt": [{"type": "text", "text": "Hello, world!"}],
+        }
+
+    def test_to_sdk_load_session_params(self):
+        """Test load-session params include the required ACP fields."""
+        from nanobot.acp.sdk_types import to_sdk_load_session_params
+
+        params = to_sdk_load_session_params("test-session-id", "/workspace/project")
+
+        assert params == {
+            "sessionId": "test-session-id",
+            "cwd": "/workspace/project",
+            "mcpServers": [],
+        }
 
 
 class TestSDKClientBasic:
@@ -135,6 +151,157 @@ class TestSDKClientNotificationRouting:
 
         # Client should accept callback registry
         assert client._callback_registry is mock_registry
+
+
+class TestSDKClientSpawn:
+    """Tests for SDK process spawning."""
+
+    @pytest.mark.asyncio
+    async def test_spawn_connection_passes_agent_args_without_binding_error(self):
+        """SDKClient forwards agent args to the ACP stdio transport."""
+        from nanobot.acp.sdk_client import SDKClient
+
+        captured: dict[str, Any] = {}
+
+        class FakeConnectionContext:
+            async def __aenter__(self) -> tuple[str, str]:
+                return ("connection", "process")
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                return None
+
+        def fake_spawn(
+            handler: Any,
+            command: str,
+            *args: str,
+            env: dict[str, str] | None = None,
+            cwd: str | None = None,
+        ) -> FakeConnectionContext:
+            captured["handler"] = handler
+            captured["command"] = command
+            captured["args"] = args
+            captured["env"] = env
+            captured["cwd"] = cwd
+            return FakeConnectionContext()
+
+        client = SDKClient(
+            agent_path="opencode",
+            args=["acp", "--log-level", "debug"],
+            env={"OPENCODE_API_KEY": "secret"},
+            cwd="/workspace/project",
+        )
+        handler = MagicMock()
+
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr("nanobot.acp.sdk_client.spawn_stdio_connection", fake_spawn)
+
+            connection, process = await client._spawn_connection(
+                command=["opencode", "acp", "--log-level", "debug"],
+                handler=handler,
+            )
+
+        assert connection == "connection"
+        assert process == "process"
+        assert captured["handler"] is handler
+        assert captured["command"] == "opencode"
+        assert captured["args"] == ("acp", "--log-level", "debug")
+        assert captured["env"] == {"OPENCODE_API_KEY": "secret"}
+        assert captured["cwd"] == "/workspace/project"
+
+    @pytest.mark.asyncio
+    async def test_client_uses_acp_wire_methods_and_tracks_session_ids(self, monkeypatch):
+        """SDKClient speaks the current ACP wire protocol expected by OpenCode."""
+        from nanobot.acp.sdk_client import SDKClient
+        from nanobot.acp.types import ACPStreamChunkType
+
+        sleep_calls: list[float] = []
+
+        async def fake_sleep(delay: float) -> None:
+            sleep_calls.append(delay)
+
+        class FakeConnection:
+            def __init__(self) -> None:
+                self.requests: list[tuple[str, dict[str, Any]]] = []
+                self.notifications: list[tuple[str, dict[str, Any]]] = []
+
+            async def send_request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+                self.requests.append((method, params))
+                if method == "initialize":
+                    return {
+                        "protocolVersion": 1,
+                        "agentCapabilities": {"loadSession": True},
+                        "agentInfo": {"name": "OpenCode", "version": "1.2.24"},
+                    }
+                if method == "session/new":
+                    return {"sessionId": "sess-123"}
+                if method == "session/set_model":
+                    return {"_meta": {"opencode": {"modelId": params["modelId"]}}}
+                if method == "session/prompt":
+                    assert client._notification_handler is not None
+                    await client._notification_handler(
+                        "session/update",
+                        {
+                            "sessionId": "sess-123",
+                            "update": {
+                                "sessionUpdate": "agent_message_chunk",
+                                "content": {"type": "text", "text": "Hello"},
+                            },
+                        },
+                        True,
+                    )
+                    return {"stopReason": "end_turn", "usage": {"totalTokens": 0}}
+                raise AssertionError(f"Unexpected request: {method}")
+
+            async def send_notification(self, method: str, params: dict[str, Any]) -> None:
+                self.notifications.append((method, params))
+
+        fake_connection = FakeConnection()
+        client = SDKClient(agent_path="opencode", args=["acp"], cwd="/workspace/project")
+        client._spawn_connection = AsyncMock(return_value=(fake_connection, "process"))
+        monkeypatch.setattr("nanobot.acp.sdk_client.asyncio.sleep", fake_sleep)
+
+        result = await client.initialize(session_id="debug-session")
+        assert result["status"] == "initialized"
+        assert client.capabilities == {"loadSession": True}
+
+        session_result = await client.new_session()
+        assert session_result["session_id"] == "sess-123"
+        assert client.current_session_id == "sess-123"
+
+        await client.set_model("openai/gpt-5.4")
+        prompt_result = await client.prompt("Hello")
+        assert [chunk.type for chunk in prompt_result] == [ACPStreamChunkType.CONTENT_DELTA]
+        assert [chunk.content for chunk in prompt_result] == ["Hello"]
+        assert sleep_calls and sleep_calls[0] > 0
+
+        await client.cancel()
+
+        assert fake_connection.requests == [
+            (
+                "initialize",
+                {
+                    "protocolVersion": 1,
+                    "clientCapabilities": {},
+                    "clientInfo": {"name": "nanobot", "version": "0.1.0"},
+                },
+            ),
+            (
+                "session/new",
+                {"cwd": "/workspace/project", "mcpServers": []},
+            ),
+            (
+                "session/set_model",
+                {"sessionId": "sess-123", "modelId": "openai/gpt-5.4"},
+            ),
+            (
+                "session/prompt",
+                {
+                    "sessionId": "sess-123",
+                    "prompt": [{"type": "text", "text": "Hello"}],
+                },
+            ),
+        ]
+        assert fake_connection.notifications == [("session/cancel", {"sessionId": "sess-123"})]
 
 
 class TestSDKClientReal:

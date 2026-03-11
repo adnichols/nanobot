@@ -340,6 +340,7 @@ class ACPAgentDefinition(Base):
 
     id: str  # Unique identifier for this agent definition
     command: str  # Command to launch the agent (e.g., "opencode")
+    model: str | None = None  # Preferred ACP session model (e.g., "openai/gpt-5.4")
     args: list[str] = Field(default_factory=list)  # Command-line arguments
     env: dict[str, str] = Field(default_factory=dict)  # Environment variables
     cwd: str | None = None  # Working directory for the agent process

@@ -11,13 +11,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Callable, Optional
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Optional
 
 from acp import spawn_stdio_connection
 from acp.connection import Connection
-from acp.schema import (
-    AgentNotification,
-)
 
 from nanobot.acp.interfaces import ACPCallbackRegistry, ACPSessionStore, ACPUpdateSink
 from nanobot.acp.sdk_types import (
@@ -31,6 +29,7 @@ from nanobot.acp.sdk_types import (
     to_sdk_new_session_params,
     to_sdk_prompt_params,
 )
+from nanobot.acp.types import ACPInitializeRequest, ACPStreamChunk, ACPStreamChunkType
 
 logger = logging.getLogger(__name__)
 
@@ -97,18 +96,25 @@ class SDKNotificationHandler:
         self._filesystem_handler = filesystem_handler
         self._terminal_manager = terminal_manager
         self._pending_responses: dict[str, asyncio.Future] = {}
+        self._stream_chunks: dict[str, list[ACPStreamChunk]] = {}
 
-    def __call__(self, notification: AgentNotification) -> None:
-        """Handle an incoming notification from the agent.
+    async def __call__(self, method: str, params: Any, is_notification: bool) -> Any | None:
+        """Handle an incoming method call from the agent.
 
         Args:
-            notification: The notification from the agent.
+            method: The ACP method name.
+            params: The ACP payload.
+            is_notification: Whether the method is a notification.
         """
-        method, params = from_sdk_notification(notification)
+        if not is_notification:
+            return None
+
+        method, params = from_sdk_notification(method, params)
         logger.debug(f"Received notification: {method}")
 
         # Route based on method
         if method == "session/update":
+            self._record_stream_chunk(params)
             self._handle_session_update(params)
         elif method == "session/request_permission":
             asyncio.create_task(self._handle_permission_request(params))
@@ -119,6 +125,14 @@ class SDKNotificationHandler:
         else:
             logger.debug(f"Unhandled notification method: {method}")
 
+    def begin_stream(self, session_id: str) -> None:
+        """Reset buffered stream chunks for a prompt request."""
+        self._stream_chunks[session_id] = []
+
+    def take_stream_chunks(self, session_id: str) -> list[ACPStreamChunk]:
+        """Return buffered stream chunks for a completed prompt request."""
+        return self._stream_chunks.pop(session_id, [])
+
     def _handle_session_update(self, params: dict[str, Any]) -> None:
         """Handle session update notifications."""
         if self._update_sink is None:
@@ -127,6 +141,30 @@ class SDKNotificationHandler:
         update = params.get("update", {})
         # Send to update sink for rendering
         asyncio.create_task(self._update_sink.send_update(update))
+
+    def _record_stream_chunk(self, params: dict[str, Any]) -> None:
+        """Capture streamed assistant text from session/update notifications."""
+        session_id = params.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            return
+
+        update = params.get("update", {})
+        session_update = update.get("session_update", {})
+        kind = session_update.get("kind") if isinstance(session_update, dict) else None
+        if kind != "agent_message_chunk":
+            return
+
+        content = update.get("content", {})
+        if not isinstance(content, dict) or content.get("type") != "text":
+            return
+
+        text = content.get("text")
+        if not isinstance(text, str) or not text:
+            return
+
+        self._stream_chunks.setdefault(session_id, []).append(
+            ACPStreamChunk(type=ACPStreamChunkType.CONTENT_DELTA, content=text)
+        )
 
     async def _handle_permission_request(self, params: dict[str, Any]) -> None:
         """Handle permission request notifications."""
@@ -198,9 +236,12 @@ class SDKClient:
     using the official agent-client-protocol SDK.
     """
 
+    _MODEL_SWITCH_SETTLE_SECONDS = 0.1
+
     def __init__(
         self,
         agent_path: Optional[str] = None,
+        model: Optional[str] = None,
         args: Optional[list[str]] = None,
         env: Optional[dict[str, str]] = None,
         cwd: Optional[str] = None,
@@ -215,6 +256,7 @@ class SDKClient:
 
         Args:
             agent_path: Path to the ACP agent executable (e.g., "opencode").
+            model: Preferred ACP session model (e.g., "openai/gpt-5.4").
             args: Arguments to pass to the agent (e.g., ["acp"]).
             env: Environment variables for the agent process.
             cwd: Working directory for the agent process.
@@ -226,6 +268,7 @@ class SDKClient:
             terminal_manager: Manager for terminal operations.
         """
         self.agent_path = agent_path
+        self.model = model
         self.args = args or []
         self.env = env
         self.cwd = cwd
@@ -244,6 +287,7 @@ class SDKClient:
         self._capabilities: Optional[dict[str, Any]] = None
         self._initialized = False
         self._conn_context: Optional[Any] = None
+        self._model_settle_deadline: Optional[float] = None
 
     @property
     def is_initialized(self) -> bool:
@@ -268,7 +312,7 @@ class SDKClient:
         """
 
         # Wrap the handler for SDK notifications
-        def sdk_handler(notification: AgentNotification) -> None:
+        def sdk_handler(notification: Any) -> None:
             method, params = from_sdk_notification(notification)
             handler(method, params)
 
@@ -323,19 +367,15 @@ class SDKClient:
 
             # Send initialize request
             init_params = to_sdk_initialize_params(
-                type(
-                    "ACPInitializeRequest",
-                    (),
-                    {
-                        "session_id": session_id or "default-session",
-                        "system_prompt": "You are a helpful AI assistant.",
-                    },
-                )()
+                ACPInitializeRequest(
+                    session_id=session_id or "default-session",
+                    system_prompt="You are a helpful AI assistant.",
+                )
             )
 
             response = await self._connection.send_request(
                 "initialize",
-                init_params.model_dump(),
+                init_params,
             )
 
             # Parse the response
@@ -357,7 +397,7 @@ class SDKClient:
     async def _spawn_connection(
         self,
         command: list[str],
-        handler: Callable[[AgentNotification], None],
+        handler: Callable[[str, Any, bool], Awaitable[Any | None]],
     ) -> tuple[Connection, Any]:
         """Spawn the stdio connection to the agent.
 
@@ -375,8 +415,8 @@ class SDKClient:
             # Get the async iterator from spawn_stdio_connection
             # Note: args must be passed as positional varargs, not keyword argument
             conn_iter = spawn_stdio_connection(
-                handler=handler,
-                command=command[0],
+                handler,
+                command[0],
                 *command[1:],
                 env=self.env,
                 cwd=self.cwd,
@@ -412,12 +452,11 @@ class SDKClient:
             }
 
         try:
-            session_id = f"session-{asyncio.get_event_loop().time():.0f}"
-            params = to_sdk_new_session_params(session_id)
+            params = to_sdk_new_session_params(self._session_cwd())
 
             response = await self._connection.send_request(
                 "session/new",
-                params.model_dump(),
+                params,
             )
 
             result = from_sdk_session_response(response)
@@ -458,11 +497,11 @@ class SDKClient:
             }
 
         try:
-            params = to_sdk_load_session_params(session_id)
+            params = to_sdk_load_session_params(session_id, self._session_cwd())
 
             response = await self._connection.send_request(
                 "session/load",
-                params.model_dump(),
+                params,
             )
 
             result = from_sdk_session_response(response)
@@ -477,7 +516,7 @@ class SDKClient:
         self,
         content: str,
         session_id: Optional[str] = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[ACPStreamChunk]:
         """Send a prompt to the ACP agent.
 
         Args:
@@ -503,31 +542,57 @@ class SDKClient:
         # Test mode: return mock response when no agent_path
         if self._connection is None:
             return [
-                {
-                    "type": "message",
-                    "content": f"Mock response to: {content}",
-                }
+                ACPStreamChunk(
+                    type=ACPStreamChunkType.CONTENT_DELTA,
+                    content=f"Mock response to: {content}",
+                )
             ]
 
         try:
+            await self._wait_for_model_settle()
             params = to_sdk_prompt_params(content, target_session)
+            if self._notification_handler is not None:
+                self._notification_handler.begin_stream(target_session)
 
             # Send the prompt request
             response = await self._connection.send_request(
-                "prompt",
-                params.model_dump(),
+                "session/prompt",
+                params,
             )
 
-            # Parse response into chunks
-            chunks = []
-            if response:
-                chunk = from_sdk_prompt_chunk(response)
-                chunks.append(chunk)
+            streamed_chunks: list[ACPStreamChunk] = []
+            if self._notification_handler is not None:
+                streamed_chunks = self._notification_handler.take_stream_chunks(target_session)
 
-            return chunks
+            return streamed_chunks + self._prompt_response_to_chunks(response)
 
         except Exception as e:
             raise SDKPromptError(f"Prompt failed: {e}") from e
+
+    async def set_model(self, model: str, session_id: Optional[str] = None) -> None:
+        """Set the active model for an ACP session."""
+        if not self._initialized or self._connection is None:
+            raise SDKConnectionError("Client not initialized. Call initialize() first.")
+
+        target_session = session_id or self._current_session_id
+        if not target_session:
+            raise SDKSessionError(
+                "No session ID available. Call new_session() or load_session() first."
+            )
+
+        try:
+            await self._connection.send_request(
+                "session/set_model",
+                {
+                    "sessionId": target_session,
+                    "modelId": model,
+                },
+            )
+            self._model_settle_deadline = (
+                asyncio.get_running_loop().time() + self._MODEL_SWITCH_SETTLE_SECONDS
+            )
+        except Exception as e:
+            raise SDKSessionError(f"Failed to set session model: {e}") from e
 
     async def cancel(self, session_id: Optional[str] = None) -> None:
         """Cancel an ongoing prompt operation.
@@ -551,8 +616,8 @@ class SDKClient:
             params = to_sdk_cancel_params(target_session)
 
             await self._connection.send_notification(
-                "cancel",
-                params.model_dump(),
+                "session/cancel",
+                params,
             )
 
         except Exception as e:
@@ -603,3 +668,25 @@ class SDKClient:
         """
         # Store the handler for notification routing
         self._terminal_manager = handler
+
+    def _session_cwd(self) -> str:
+        """Return the cwd to send in ACP session requests."""
+        return self.cwd or str(Path.cwd())
+
+    def _prompt_response_to_chunks(self, response: Any) -> list[ACPStreamChunk]:
+        """Normalize an ACP prompt response to nanobot stream chunks."""
+        parsed = from_sdk_prompt_chunk(response)
+        content = parsed.get("content")
+        if isinstance(content, str) and content:
+            return [ACPStreamChunk(type=ACPStreamChunkType.CONTENT_DELTA, content=content)]
+        return []
+
+    async def _wait_for_model_settle(self) -> None:
+        """Wait briefly after a session model switch before prompting."""
+        if self._model_settle_deadline is None:
+            return
+
+        remaining = self._model_settle_deadline - asyncio.get_running_loop().time()
+        self._model_settle_deadline = None
+        if remaining > 0:
+            await asyncio.sleep(remaining)
