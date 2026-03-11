@@ -94,6 +94,7 @@ class ACPCronHandler:
 
         logger.info("ACP cron: processing job '{}' for session {}", job.name, session_key)
 
+        session_result = None
         try:
             # Load or create ACP session
             session_result = await self._acp_service.load_session(session_key)
@@ -126,6 +127,14 @@ class ACPCronHandler:
             if job.payload.deliver:
                 await self._deliver_response(job, f"Cron error: {str(e)[:200]}")
             raise
+        finally:
+            # Always cleanup the session after execution
+            if session_result and self._acp_service:
+                try:
+                    await self._acp_service.shutdown_session(session_key)
+                    logger.debug("ACP cron: session {} cleaned up", session_key)
+                except Exception as cleanup_error:
+                    logger.warning("ACP cron: session cleanup failed: {}", cleanup_error)
 
     def _get_session_key(self, job: "CronJob") -> Optional[str]:
         """Derive session key from cron job payload.

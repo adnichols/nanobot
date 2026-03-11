@@ -10,12 +10,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from nanobot.acp.client import ACPClient
 from nanobot.acp.interfaces import ACPCallbackRegistry, ACPSessionStore, ACPUpdateSink
+from nanobot.acp.sdk_client import SDKClient, SDKError
 from nanobot.acp.store import ACPSessionBindingStore
-from nanobot.acp.types import (
-    ACPStreamChunk,
-)
 
 
 @dataclass
@@ -44,7 +41,9 @@ class ACPService:
         self._config = config or ACPServiceConfig()
         self._session_store: Optional[ACPSessionStore] = None
         self._binding_store: Optional[ACPSessionBindingStore] = None
-        self._clients: dict[str, ACPClient] = {}
+        self._clients: dict[str, SDKClient] = {}
+        # Cache capabilities from initialize responses
+        self._capabilities: dict[str, Any] = {}
 
         # Initialize stores if storage dir is provided
         if self._config.storage_dir:
@@ -52,6 +51,27 @@ class ACPService:
 
             self._session_store = ACPFileSessionStore(self._config.storage_dir / "sessions")
             self._binding_store = ACPSessionBindingStore(self._config.storage_dir / "bindings")
+
+    def _create_client(self) -> SDKClient:
+        """Create an SDK client with proper configuration.
+
+        Returns:
+            Configured SDKClient instance.
+        """
+        # Extract args, env, cwd from agent_definition if provided
+        agent_def = self._config.agent_definition
+        args = getattr(agent_def, "args", None) or []
+        env = getattr(agent_def, "env", None) or None
+        cwd = getattr(agent_def, "cwd", None) or None
+
+        return SDKClient(
+            agent_path=self._config.agent_path,
+            args=args if args else None,
+            env=env,
+            cwd=cwd,
+            session_store=self._session_store,
+            callback_registry=self._config.callback_registry,
+        )
 
     async def create_session(
         self,
@@ -68,20 +88,19 @@ class ACPService:
             Dict containing session information.
         """
         # Create a new client for this session with full agent definition
-        client = ACPClient(
-            agent_path=self._config.agent_path,
-            session_store=self._session_store,
-            callback_registry=self._config.callback_registry,
-            agent_definition=self._config.agent_definition,
-        )
+        client = self._create_client()
 
         # Initialize and create session
         await client.initialize()
-        result = await client.create_session()
+        result = await client.new_session()
 
         acp_session_id = result.get("session_id")
         if not isinstance(acp_session_id, str) or not acp_session_id:
             raise RuntimeError("ACP session creation did not return a session_id")
+
+        # Cache capabilities for this agent
+        if client.capabilities:
+            self._capabilities[agent_id] = client.capabilities
 
         # Store the binding
         if self._binding_store:
@@ -122,25 +141,66 @@ class ACPService:
             # No existing session - create a new one
             return await self.create_session(nanobot_session_key)
 
-        # Create client and load the session
-        client = ACPClient(
-            agent_path=self._config.agent_path,
-            session_store=self._session_store,
-            callback_registry=self._config.callback_registry,
-            agent_definition=self._config.agent_definition,
-        )
-
+        # Create client and initialize
+        client = self._create_client()
         await client.initialize()
-        result = await client.load_session(binding.acp_session_id)
+
+        # Cache capabilities
+        if client.capabilities:
+            self._capabilities[binding.acp_agent_id] = client.capabilities
+
+        # Check if agent has loadSession capability
+        agent_capabilities = client.capabilities or {}
+        has_load_session = agent_capabilities.get("loadSession", False)
+
+        acp_session_id: str
+        status: str
+
+        if has_load_session:
+            # Agent supports session/load - try to load existing session
+            try:
+                result = await client.load_session(binding.acp_session_id)
+                acp_session_id = binding.acp_session_id
+                status = "loaded"
+            except SDKError:
+                # Load failed - fallback to creating new session
+                result = await client.new_session()
+                acp_session_id = result.get("session_id", "")
+                status = "created"
+                # Rebind the new session
+                if self._binding_store:
+                    from nanobot.acp.store import ACPSessionBinding
+
+                    new_binding = ACPSessionBinding(
+                        nanobot_session_key=nanobot_session_key,
+                        acp_agent_id=binding.acp_agent_id,
+                        acp_session_id=acp_session_id,
+                    )
+                    self._binding_store.save_binding(new_binding)
+        else:
+            # Agent doesn't support loadSession - create new session and rebind
+            result = await client.new_session()
+            acp_session_id = result.get("session_id", "")
+            status = "created"
+            # Rebind the new session
+            if self._binding_store:
+                from nanobot.acp.store import ACPSessionBinding
+
+                new_binding = ACPSessionBinding(
+                    nanobot_session_key=nanobot_session_key,
+                    acp_agent_id=binding.acp_agent_id,
+                    acp_session_id=acp_session_id,
+                )
+                self._binding_store.save_binding(new_binding)
 
         # Track the client
         self._clients[nanobot_session_key] = client
 
         return {
             "nanobot_session_key": nanobot_session_key,
-            "acp_session_id": binding.acp_session_id,
+            "acp_session_id": acp_session_id,
             "agent_id": binding.acp_agent_id,
-            "status": "loaded",
+            "status": status,
             "session": result.get("session"),
         }
 
@@ -148,7 +208,7 @@ class ACPService:
         self,
         nanobot_session_key: str,
         message: str,
-    ) -> list[ACPStreamChunk]:
+    ) -> list[dict[str, Any]]:
         """Process an incoming chat message through ACP.
 
         Args:

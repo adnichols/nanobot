@@ -45,6 +45,7 @@ class AgentLoop:
     """
 
     _TOOL_RESULT_MAX_CHARS = 500
+    _ACP_ROUTE_TIMEOUT_SECONDS = 5.0
 
     def __init__(
         self,
@@ -516,8 +517,29 @@ class AgentLoop:
                         content="New session started (ACP).",
                     )
 
-            # Route to ACP backend
-            return await self._route_to_acp(key, msg.content, on_progress, msg.channel, msg.chat_id)
+            # Route to ACP backend, but fail open to the local agent if ACP hangs or errors.
+            try:
+                response = await asyncio.wait_for(
+                    self._route_to_acp(key, msg.content, on_progress, msg.channel, msg.chat_id),
+                    timeout=self._ACP_ROUTE_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "ACP routing timed out for session {}; falling back to local agent",
+                    key,
+                )
+                if self.acp_service:
+                    try:
+                        await self.acp_service.cancel_operation(key)
+                    except Exception:
+                        logger.exception("Failed to cancel timed-out ACP session {}", key)
+            else:
+                if response and not response.content.startswith("ACP error:"):
+                    return response
+                logger.warning(
+                    "ACP routing failed for session {}; falling back to local agent",
+                    key,
+                )
 
         session = self.sessions.get_or_create(key)
 

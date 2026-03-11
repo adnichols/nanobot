@@ -41,11 +41,16 @@ def _get_acp_service(config: Config):
         from nanobot.acp.service import ACPService, ACPServiceConfig
 
         storage_dir = config.workspace_path / ".nanobot" / "acp"
+
+        # Get the full agent definition
+        agent_def = None
+        if config.acp.default_agent in config.acp.agents:
+            agent_def = config.acp.agents.get(config.acp.default_agent)
+
         acp_config = ACPServiceConfig(
             storage_dir=storage_dir,
-            agent_path=config.acp.agents.get(config.acp.default_agent).command
-            if config.acp.default_agent in config.acp.agents
-            else None,
+            agent_path=agent_def.command if agent_def else None,
+            agent_definition=agent_def,
         )
         _acp_service = ACPService(acp_config)
         return _acp_service
@@ -509,26 +514,22 @@ def agent(
     else:
         logger.disable("nanobot")
 
-    agent_loop = AgentLoop(
-        bus=bus,
-        provider=provider,
-        workspace=config.workspace_path,
-        model=config.agents.defaults.model,
-        temperature=config.agents.defaults.temperature,
-        max_tokens=config.agents.defaults.max_tokens,
-        max_iterations=config.agents.defaults.max_tool_iterations,
-        memory_window=config.agents.defaults.memory_window,
-        reasoning_effort=config.agents.defaults.reasoning_effort,
-        brave_api_key=config.tools.web.search.api_key or None,
-        web_proxy=config.tools.web.proxy or None,
-        exec_config=config.tools.exec,
-        cron_service=cron,
-        restrict_to_workspace=config.tools.restrict_to_workspace,
-        mcp_servers=config.tools.mcp_servers,
-        channels_config=config.channels,
-        acp_service=acp_service,
-        acp_default_agent=config.acp.default_agent,
-    )
+        acp_service = _get_acp_service(config)
+        # Initialize ACP service if configured
+        acp_service = _get_acp_service(config)
+
+        # Get ACP service if enabled
+        acp_service = _get_acp_service(config)
+        if acp_service:
+            typer.echo(f"ACP service initialized: {config.acp.default_agent}")
+
+        agent_loop = AgentLoop(
+            config=config,
+            local_agent=local_agent,
+            acp_service=acp_service,
+            acp_default_agent=config.acp.default_agent,
+            update_callback=lambda update: None,
+        )
 
     # Show spinner when logs are off (no output to miss); skip when logs are on
     def _thinking_ctx():

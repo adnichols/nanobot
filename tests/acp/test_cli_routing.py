@@ -14,6 +14,7 @@ RED PHASE: These tests capture the gaps where:
 - /stop doesn't propagate to ACP service cancel
 """
 
+import asyncio
 import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -205,15 +206,24 @@ async def test_load_session_preserves_agent_definition_on_resume():
     binding = MagicMock(acp_session_id="sess-123", acp_agent_id="opencode")
     service._binding_store = MagicMock(load_binding=MagicMock(return_value=binding))
 
-    with patch("nanobot.acp.service.ACPClient") as mock_client_cls:
+    with patch("nanobot.acp.service.SDKClient") as mock_client_cls:
         client = MagicMock()
-        client.initialize = AsyncMock()
-        client.load_session = AsyncMock(return_value={"session": {"id": "sess-123"}})
+        client.initialize = AsyncMock(return_value={"status": "initialized", "capabilities": {}})
+        client.capabilities = {}
+        client.load_session = AsyncMock(
+            return_value={"session": {"id": "sess-123"}, "status": "loaded"}
+        )
+        client.new_session = AsyncMock(
+            return_value={"session_id": "new-session", "status": "created"}
+        )
         mock_client_cls.return_value = client
 
         await service.load_session("cli:direct")
 
-    assert mock_client_cls.call_args.kwargs["agent_definition"] is agent_definition
+    # Verify that args, env, cwd are extracted from agent_definition and passed to SDKClient
+    assert mock_client_cls.call_args.kwargs["args"] == ["acp", "--verbose"]
+    assert mock_client_cls.call_args.kwargs["env"] == {"OPENCODE_API_KEY": "secret123"}
+    assert mock_client_cls.call_args.kwargs["cwd"] == "/workspace/myproject"
 
 
 # ============================================================================
@@ -334,6 +344,104 @@ class TestChannelPreservation:
             assert response is not None
             assert response.channel == "whatsapp"
             assert response.chat_id == "+1234567890"
+
+
+class TestACPFallback:
+    @pytest.mark.asyncio
+    async def test_process_message_falls_back_to_local_when_acp_errors(self):
+        from nanobot.agent.loop import AgentLoop
+        from nanobot.bus.events import InboundMessage
+        from nanobot.bus.queue import MessageBus
+
+        bus = MagicMock(spec=MessageBus)
+        mock_provider = MagicMock()
+        mock_provider.get_default_model.return_value = "test-model"
+        mock_provider.chat = AsyncMock(
+            return_value=MagicMock(
+                content="Local fallback response",
+                has_tool_calls=False,
+                finish_reason="stop",
+                reasoning_content=None,
+                thinking_blocks=None,
+            )
+        )
+
+        mock_acp_service = MagicMock()
+        mock_acp_service.load_session = AsyncMock(side_effect=RuntimeError("ACP unavailable"))
+        mock_acp_service.cancel_operation = AsyncMock()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            agent = AgentLoop(
+                bus=bus,
+                provider=mock_provider,
+                workspace=Path(tmpdir),
+                acp_service=mock_acp_service,
+                acp_default_agent="opencode",
+            )
+
+            response = await agent._process_message(
+                InboundMessage(
+                    channel="telegram",
+                    sender_id="user",
+                    chat_id="123",
+                    content="hello",
+                )
+            )
+
+        assert response is not None
+        assert response.content == "Local fallback response"
+        assert response.channel == "telegram"
+        assert response.chat_id == "123"
+
+    @pytest.mark.asyncio
+    async def test_process_message_falls_back_to_local_when_acp_times_out(self):
+        from nanobot.agent.loop import AgentLoop
+        from nanobot.bus.events import InboundMessage
+        from nanobot.bus.queue import MessageBus
+
+        bus = MagicMock(spec=MessageBus)
+        mock_provider = MagicMock()
+        mock_provider.get_default_model.return_value = "test-model"
+        mock_provider.chat = AsyncMock(
+            return_value=MagicMock(
+                content="Timed out fallback response",
+                has_tool_calls=False,
+                finish_reason="stop",
+                reasoning_content=None,
+                thinking_blocks=None,
+            )
+        )
+
+        async def slow_load_session(*_args, **_kwargs):
+            await asyncio.sleep(0.05)
+            return {"acp_session_id": "slow-session"}
+
+        mock_acp_service = MagicMock()
+        mock_acp_service.load_session = AsyncMock(side_effect=slow_load_session)
+        mock_acp_service.cancel_operation = AsyncMock()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            agent = AgentLoop(
+                bus=bus,
+                provider=mock_provider,
+                workspace=Path(tmpdir),
+                acp_service=mock_acp_service,
+                acp_default_agent="opencode",
+            )
+            agent._ACP_ROUTE_TIMEOUT_SECONDS = 0.01
+
+            response = await agent._process_message(
+                InboundMessage(
+                    channel="telegram",
+                    sender_id="user",
+                    chat_id="123",
+                    content="hello",
+                )
+            )
+
+        assert response is not None
+        assert response.content == "Timed out fallback response"
+        mock_acp_service.cancel_operation.assert_awaited_once_with("telegram:123")
 
 
 # ============================================================================

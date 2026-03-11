@@ -1,4 +1,4 @@
-"""Acceptance tests for real OpenCode ACP backend.
+"""Acceptance tests for real OpenCode ACP backend with SDK.
 
 These tests verify the full ACP flow with a real OpenCode backend when available.
 They are gated behind an explicit pytest marker and require opt-in environment variable.
@@ -7,16 +7,19 @@ To run these tests:
     NANOBOT_TEST_OPENCODE=1 uv run pytest tests/acp/test_acceptance_opencode.py -v -m opencode_real
 
 By default, these tests are skipped to keep the test suite hermetic.
+
+These tests verify the SDK-based ACP integration works correctly with OpenCode.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 
 import pytest
 
-from nanobot.acp.opencode import OpenCodeBackend
-from nanobot.acp.types import ACPSessionRecord
+from nanobot.acp.sdk_client import SDKClient
+from nanobot.acp.service import ACPService, ACPServiceConfig
 from nanobot.config.schema import ACPAgentDefinition
 
 # Pytest marker for real OpenCode tests
@@ -32,12 +35,96 @@ def should_run_real_tests() -> bool:
     return os.environ.get("NANOBOT_TEST_OPENCODE") == "1"
 
 
-class TestOpenCodeBackendSmoke:
-    """Smoke tests for real OpenCode backend initialization."""
+def is_opencode_available() -> bool:
+    """Check if opencode is installed and available."""
+    return shutil.which("opencode") is not None
+
+
+# =============================================================================
+# RED Tests: Real Prompt Round-Trip
+# =============================================================================
+
+
+class TestRealPromptRoundTrip:
+    """RED tests for real prompt round-trip.
+
+    These tests verify that the SDK client can communicate with real OpenCode.
+    """
+
+    @pytest.mark.skipif(not should_run_real_tests(), reason="Real backend tests opt-in only")
+    @pytest.mark.asyncio
+    async def test_sdk_client_initializes_with_opencode(self):
+        """Given opencode is installed, when SDK client is initialized,
+        then it connects and gets capabilities from the agent."""
+        if not is_opencode_available():
+            pytest.skip("opencode not installed")
+
+        # Create SDK client with opencode
+        client = SDKClient(
+            agent_path="opencode",
+            args=["acp"],
+        )
+
+        # Initialize - this should connect to OpenCode via stdio
+        result = await client.initialize(session_id="test-session")
+
+        # Verify initialization succeeded
+        assert result["status"] == "initialized"
+        assert client.is_initialized is True
+
+    @pytest.mark.skipif(not should_run_real_tests(), reason="Real backend tests opt-in only")
+    @pytest.mark.asyncio
+    async def test_sdk_client_creates_session_with_opencode(self):
+        """Given SDK client is initialized, when new_session is called,
+        then it creates a session via the ACP protocol."""
+        if not is_opencode_available():
+            pytest.skip("opencode not installed")
+
+        client = SDKClient(
+            agent_path="opencode",
+            args=["acp"],
+        )
+
+        await client.initialize(session_id="test")
+        result = await client.new_session()
+
+        assert result["status"] == "created"
+        assert result["session_id"] is not None
+
+    @pytest.mark.skipif(not should_run_real_tests(), reason="Real backend tests opt-in only")
+    @pytest.mark.asyncio
+    async def test_sdk_client_sends_prompt_to_opencode(self):
+        """Given SDK client has a session, when prompt is sent,
+        then it receives a response from OpenCode."""
+        if not is_opencode_available():
+            pytest.skip("opencode not installed")
+
+        client = SDKClient(
+            agent_path="opencode",
+            args=["acp"],
+        )
+
+        await client.initialize(session_id="test")
+        await client.new_session()
+
+        # Send a simple prompt
+        chunks = await client.prompt(content="Hello")
+
+        # Verify we got a response
+        assert len(chunks) > 0
+        assert chunks[0].get("content") is not None
+
+
+# =============================================================================
+# Tests: SDK Client Configuration
+# =============================================================================
+
+
+class TestSDKClientConfiguration:
+    """Tests for SDK client configuration from agent definition."""
 
     @pytest.fixture
     def opencode_agent_config(self):
-        """Provide a minimal OpenCode agent configuration."""
         return ACPAgentDefinition(
             id="opencode-agent",
             command="opencode",
@@ -48,36 +135,22 @@ class TestOpenCodeBackendSmoke:
 
     @pytest.mark.skipif(not should_run_real_tests(), reason="Real backend tests opt-in only")
     @pytest.mark.asyncio
-    async def test_real_backend_initialization(self, opencode_agent_config):
-        """Given OpenCode is installed, when the backend is initialized,
-        then it starts successfully and reports capabilities."""
-        backend = OpenCodeBackend(opencode_agent_config)
+    async def test_client_uses_agent_path_from_config(self, opencode_agent_config):
+        """Given an agent config with command, when SDK client is created,
+        then it uses the correct command and args."""
+        # Create client from config - equivalent to what ACPService does
+        client = SDKClient(
+            agent_path=opencode_agent_config.command,
+            args=opencode_agent_config.args,
+        )
 
-        # Verify config is properly set
-        assert backend.agent_id == "opencode-agent"
-        assert backend.get_launch_command() == ["opencode", "acp"]
-
-        # Verify capabilities are returned
-        capabilities = backend.get_capabilities()
-        assert capabilities.supports_session_persistence is True
-        assert capabilities.supports_streaming is True
-        assert "read" in capabilities.tools
+        assert client.agent_path == "opencode"
+        assert client.args == ["acp"]
 
     @pytest.mark.skipif(not should_run_real_tests(), reason="Real backend tests opt-in only")
     @pytest.mark.asyncio
-    async def test_real_backend_launch_command_generation(self, opencode_agent_config):
-        """Given an agent config, when launch command is generated,
-        then it includes the correct command and arguments."""
-        backend = OpenCodeBackend(opencode_agent_config)
-
-        cmd = backend.get_launch_command()
-        assert cmd[0] == "opencode"
-        assert "acp" in cmd
-
-    @pytest.mark.skipif(not should_run_real_tests(), reason="Real backend tests opt-in only")
-    @pytest.mark.asyncio
-    async def test_real_backend_environment_variables(self, opencode_agent_config):
-        """Given an agent config with env vars, when env is generated,
+    async def test_client_uses_env_from_config(self):
+        """Given an agent config with env vars, when client is created,
         then it includes the configured variables."""
         config_with_env = ACPAgentDefinition(
             id="opencode-agent",
@@ -85,16 +158,20 @@ class TestOpenCodeBackendSmoke:
             args=["acp"],
             env={"CUSTOM_VAR": "test-value"},
         )
-        backend = OpenCodeBackend(config_with_env)
 
-        env = backend.get_launch_env()
-        assert "CUSTOM_VAR" in env
-        assert env["CUSTOM_VAR"] == "test-value"
+        client = SDKClient(
+            agent_path=config_with_env.command,
+            args=config_with_env.args,
+            env=config_with_env.env,
+        )
+
+        assert client.env is not None
+        assert client.env.get("CUSTOM_VAR") == "test-value"
 
     @pytest.mark.skipif(not should_run_real_tests(), reason="Real backend tests opt-in only")
     @pytest.mark.asyncio
-    async def test_real_backend_working_directory(self, opencode_agent_config):
-        """Given an agent config with cwd, when backend is configured,
+    async def test_client_uses_cwd_from_config(self):
+        """Given an agent config with cwd, when client is created,
         then the working directory is set correctly."""
         import tempfile
 
@@ -105,163 +182,98 @@ class TestOpenCodeBackendSmoke:
                 args=["acp"],
                 cwd=tmpdir,
             )
-            backend = OpenCodeBackend(config_with_cwd)
 
-            cwd = backend.get_working_directory()
-            assert cwd is not None
-            assert str(cwd) == tmpdir
-
-
-class TestOpenCodeSessionFlow:
-    """Tests for session flow with real OpenCode backend."""
-
-    @pytest.mark.skipif(not should_run_real_tests(), reason="Real backend tests opt-in only")
-    @pytest.mark.asyncio
-    async def test_build_initialize_payload(self):
-        """Given session config, when initialize payload is built,
-        then it contains the correct structure."""
-        config = ACPAgentDefinition(
-            id="opencode-agent",
-            command="opencode",
-            args=["acp"],
-            cwd="/workspace",
-        )
-        backend = OpenCodeBackend(config)
-
-        payload = backend.build_initialize_payload(
-            session_id="test-session-123",
-            mcp_servers=None,
-        )
-
-        assert payload["session_id"] == "test-session-123"
-        assert "capabilities" in payload
-        assert payload["cwd"] == "/workspace"
-
-    @pytest.mark.skipif(not should_run_real_tests(), reason="Real backend tests opt-in only")
-    @pytest.mark.asyncio
-    async def test_build_load_session_payload(self):
-        """Given session ID, when load session payload is built,
-        then it contains the session ID."""
-        config = ACPAgentDefinition(
-            id="opencode-agent",
-            command="opencode",
-            args=["acp"],
-        )
-        backend = OpenCodeBackend(config)
-
-        payload = backend.build_load_session_payload(session_id="load-session-123")
-
-        assert payload["session_id"] == "load-session-123"
-
-    @pytest.mark.skipif(not should_run_real_tests(), reason="Real backend tests opt-in only")
-    @pytest.mark.asyncio
-    async def test_build_recovery_payload(self):
-        """Given session record, when recovery payload is built,
-        then it contains the full session state."""
-        from datetime import UTC, datetime
-
-        config = ACPAgentDefinition(
-            id="opencode-agent",
-            command="opencode",
-            args=["acp"],
-        )
-        backend = OpenCodeBackend(config)
-
-        session_record = ACPSessionRecord(
-            id="recovery-session",
-            created_at=datetime.now(UTC),
-            updated_at=datetime.now(UTC),
-            state={"key": "value"},
-            messages=[{"role": "user", "content": "test"}],
-        )
-
-        payload = backend.build_recovery_payload(session_record)
-
-        assert payload["session_id"] == "recovery-session"
-        assert payload["state"] == {"key": "value"}
-
-
-class TestOpenCodeMCPServers:
-    """Tests for MCP server mapping with OpenCode backend."""
-
-    @pytest.mark.skipif(not should_run_real_tests(), reason="Real backend tests opt-in only")
-    @pytest.mark.asyncio
-    async def test_map_stdio_mcp_server(self):
-        """Given a stdio MCP server config, when mapped to payload,
-        then it has correct type and command."""
-        from nanobot.config.schema import MCPServerConfig
-
-        config = ACPAgentDefinition(
-            id="opencode-agent",
-            command="opencode",
-            args=["acp"],
-        )
-        backend = OpenCodeBackend(config)
-
-        mcp_servers = {
-            "filesystem": MCPServerConfig(
-                command="npx",
-                args=["-y", "@modelcontextprotocol/server-filesystem", "/path"],
+            client = SDKClient(
+                agent_path=config_with_cwd.command,
+                args=config_with_cwd.args,
+                cwd=config_with_cwd.cwd,
             )
-        }
 
-        payload = backend.build_initialize_payload(
-            session_id="test",
-            mcp_servers=mcp_servers,
-        )
-
-        assert "mcp_servers" in payload
-        assert payload["mcp_servers"]["filesystem"]["type"] == "stdio"
-        assert payload["mcp_servers"]["filesystem"]["command"] == "npx"
-
-    @pytest.mark.skipif(not should_run_real_tests(), reason="Real backend tests opt-in only")
-    @pytest.mark.asyncio
-    async def test_map_http_mcp_server(self):
-        """Given an HTTP MCP server config, when mapped to payload,
-        then it has correct type and URL."""
-        from nanobot.config.schema import MCPServerConfig
-
-        config = ACPAgentDefinition(
-            id="opencode-agent",
-            command="opencode",
-            args=["acp"],
-        )
-        backend = OpenCodeBackend(config)
-
-        mcp_servers = {
-            "remote": MCPServerConfig(
-                url="https://example.com/mcp/",
-                headers={"Authorization": "Bearer token"},
-            )
-        }
-
-        payload = backend.build_initialize_payload(
-            session_id="test",
-            mcp_servers=mcp_servers,
-        )
-
-        assert "mcp_servers" in payload
-        assert payload["mcp_servers"]["remote"]["type"] == "http"
-        assert payload["mcp_servers"]["remote"]["url"] == "https://example.com/mcp/"
+            assert client.cwd == tmpdir
 
 
-class TestOpenCodeRealBackendIntegration:
-    """Integration tests that require real OpenCode to be installed."""
+# =============================================================================
+# Tests: ACP Service Integration
+# =============================================================================
+
+
+class TestACPServiceIntegration:
+    """Tests for ACPService with real OpenCode backend."""
 
     @pytest.mark.skipif(not should_run_real_tests(), reason="Real backend tests opt-in only")
     @pytest.mark.asyncio
-    async def test_opencode_binary_exists(self):
+    async def test_service_creates_session(self, tmp_path):
+        """Given ACPService is configured with OpenCode, when create_session is called,
+        then it creates an ACP session via the SDK."""
+        if not is_opencode_available():
+            pytest.skip("opencode not installed")
+
+        # Create service with OpenCode config
+        service = ACPService(
+            config=ACPServiceConfig(
+                agent_path="opencode",
+                storage_dir=tmp_path / "data",
+            ),
+        )
+
+        result = await service.create_session(
+            nanobot_session_key="telegram:12345",
+            agent_id="opencode-agent",
+        )
+
+        assert result["status"] == "created"
+        assert result["acp_session_id"] is not None
+        assert result["nanobot_session_key"] == "telegram:12345"
+
+    @pytest.mark.skipif(not should_run_real_tests(), reason="Real backend tests opt-in only")
+    @pytest.mark.asyncio
+    async def test_service_loads_session(self, tmp_path):
+        """Given ACPService has a saved binding, when load_session is called,
+        then it loads or creates a session appropriately."""
+        if not is_opencode_available():
+            pytest.skip("opencode not installed")
+
+        service = ACPService(
+            config=ACPServiceConfig(
+                agent_path="opencode",
+                storage_dir=tmp_path / "data",
+            ),
+        )
+
+        # First create a session
+        await service.create_session(
+            nanobot_session_key="telegram:12345",
+            agent_id="opencode-agent",
+        )
+
+        # Now load the session - should find the binding
+        result = await service.load_session(nanobot_session_key="telegram:12345")
+
+        # Should either load existing or create new - both are valid
+        assert result["nanobot_session_key"] == "telegram:12345"
+
+
+# =============================================================================
+# Tests: Real Backend Binary
+# =============================================================================
+
+
+class TestOpenCodeRealBackend:
+    """Tests that verify OpenCode binary is available and working."""
+
+    @pytest.mark.skipif(
+        not should_run_real_tests(), reason="Real backend tests require NANOBOT_TEST_OPENCODE=1"
+    )
+    def test_opencode_binary_exists(self):
         """Given opencode is installed, when we check,
         then it can be found in PATH."""
-        import shutil
-
-        # Check if opencode is available
         opencode_path = shutil.which("opencode")
         assert opencode_path is not None, "OpenCode binary not found in PATH"
 
-    @pytest.mark.skipif(not should_run_real_tests(), reason="Real backend tests opt-in only")
-    @pytest.mark.asyncio
-    async def test_opencode_acp_help(self):
+    @pytest.mark.skipif(
+        not should_run_real_tests(), reason="Real backend tests require NANOBOT_TEST_OPENCODE=1"
+    )
+    def test_opencode_acp_help(self):
         """Given opencode is installed, when we run acp subcommand,
         then it doesn't immediately error."""
         import subprocess
@@ -271,13 +283,40 @@ class TestOpenCodeRealBackendIntegration:
             capture_output=True,
             timeout=10,
         )
-        # Either it shows help or it starts interactive (which we treat as success)
-        # The key is it doesn't immediately fail with "command not found"
+        # OpenCode might return 0 or just not crash on --help
         assert (
             result.returncode in [0, 1]
             or "opencode" in result.stderr.decode()
             or "acp" in result.stderr.decode()
         )
+
+
+# =============================================================================
+# Tests: SDK Type Conversions
+# =============================================================================
+
+
+class TestSDKTypeConversions:
+    """Tests for SDK type conversion utilities."""
+
+    @pytest.mark.skipif(not should_run_real_tests(), reason="Real backend tests opt-in only")
+    @pytest.mark.asyncio
+    async def test_initialize_response_contains_capabilities(self):
+        """Given OpenCode responds to initialize, when we check,
+        then capabilities are present in the response."""
+        if not is_opencode_available():
+            pytest.skip("opencode not installed")
+
+        client = SDKClient(
+            agent_path="opencode",
+            args=["acp"],
+        )
+
+        result = await client.initialize(session_id="test")
+
+        # Capabilities should be present (may be empty dict in mock mode,
+        # but should be populated from real agent)
+        assert "capabilities" in result
 
 
 # Skip all tests in this module if real tests not enabled

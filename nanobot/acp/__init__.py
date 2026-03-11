@@ -1,6 +1,5 @@
 """ACP (Agent Communication Protocol) shared types and interfaces."""
 
-from nanobot.acp.client import ACPClient
 from nanobot.acp.contracts import (
     ACPContract,
     ACPContractViolation,
@@ -13,7 +12,7 @@ from nanobot.acp.interfaces import (
     ACPSessionStore,
     ACPUpdateSink,
 )
-from nanobot.acp.runtime import ACPAgentRuntime, ACPCapabilities, DefaultCallbackRegistry
+from nanobot.acp.sdk_client import SDKClient
 from nanobot.acp.service import ACPService, ACPServiceConfig
 from nanobot.acp.session import ACPSession, ACPSessionManager
 from nanobot.acp.types import (
@@ -45,12 +44,8 @@ __all__ = [
     # Contracts
     "ACPContract",
     "ACPContractViolation",
-    # Runtime
-    "ACPAgentRuntime",
-    "ACPCapabilities",
-    "DefaultCallbackRegistry",
-    # Client
-    "ACPClient",
+    # SDK Client
+    "SDKClient",
     # Service
     "ACPService",
     "ACPServiceConfig",
