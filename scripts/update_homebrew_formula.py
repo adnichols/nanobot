@@ -29,6 +29,7 @@ PYTHON_FORMULA = "python@3.13"
 SOURCE_WAIT_SECONDS = 300
 SOURCE_WAIT_INTERVAL_SECONDS = 15
 EXCLUDED_RESOURCES = {"hf-xet"}
+REQUIRED_RESOURCES = {"agent-client-protocol"}
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,44 @@ def filter_resource_block(resource_block: str) -> str:
             flags=re.MULTILINE,
         )
     return filtered.strip()
+
+
+def lock_packages(lock_path: Path = ROOT / "uv.lock") -> dict[str, dict]:
+    data = tomllib.loads(lock_path.read_text(encoding="utf-8"))
+    return {pkg["name"]: pkg for pkg in data["package"]}
+
+
+def build_resource_block(name: str, package: dict) -> str:
+    artifact = package.get("sdist") or (package.get("wheels") or [None])[0]
+    if not artifact:
+        raise RuntimeError(f"No distributable artifact available for resource {name}")
+
+    digest = artifact["hash"]
+    if digest.startswith("sha256:"):
+        digest = digest.split(":", 1)[1]
+
+    return "\n".join(
+        [
+            f'resource "{name}" do',
+            f'    url "{artifact["url"]}"',
+            f'    sha256 "{digest}"',
+            "  end",
+        ]
+    )
+
+
+def ensure_required_resources(resource_block: str, required_resources: set[str]) -> str:
+    packages = lock_packages()
+    blocks = [resource_block.strip()] if resource_block.strip() else []
+
+    for name in sorted(required_resources):
+        if re.search(rf'^\s*resource "{re.escape(name)}" do$', resource_block, flags=re.MULTILINE):
+            continue
+        if name not in packages:
+            raise RuntimeError(f"Required Homebrew resource {name} missing from uv.lock")
+        blocks.append(build_resource_block(name, packages[name]))
+
+    return "\n\n".join(block for block in blocks if block).strip()
 
 
 def render_formula(source: SourceArtifact, resource_block: str) -> str:
@@ -211,7 +250,8 @@ def refresh_resource_block(
     finally:
         cleanup_temp_tap(tap_name, tap_path)
 
-    return filter_resource_block(result.stdout)
+    filtered = filter_resource_block(result.stdout)
+    return ensure_required_resources(filtered, REQUIRED_RESOURCES)
 
 
 def wait_for_source_artifact(package_name: str, version: str, wait_seconds: int) -> SourceArtifact:

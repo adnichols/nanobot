@@ -55,7 +55,8 @@ def _get_acp_service(config: Config):
         )
         _acp_service = ACPService(acp_config)
         return _acp_service
-    except ImportError:
+    except ImportError as exc:
+        print(f"Warning: ACP unavailable, falling back to local agent: {exc}")
         return None
 
 

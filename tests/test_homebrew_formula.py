@@ -96,3 +96,27 @@ def test_filter_resource_block_excludes_hf_xet_only():
 
     assert 'resource "click" do' in filtered
     assert 'resource "hf-xet" do' not in filtered
+
+
+def test_ensure_required_resources_appends_missing_lock_resource(monkeypatch):
+    monkeypatch.setattr(
+        brew_formula,
+        "lock_packages",
+        lambda: {
+            "agent-client-protocol": {
+                "sdist": {
+                    "url": "https://files.pythonhosted.org/packages/source/a/agent_client_protocol/agent_client_protocol-0.8.1.tar.gz",
+                    "hash": "sha256:abc123",
+                }
+            }
+        },
+    )
+
+    ensured = brew_formula.ensure_required_resources(
+        'resource "click" do\n  url "https://example.invalid/click.tar.gz"\n  sha256 "aaa"\nend',
+        {"agent-client-protocol"},
+    )
+
+    assert 'resource "click" do' in ensured
+    assert 'resource "agent-client-protocol" do' in ensured
+    assert 'sha256 "abc123"' in ensured

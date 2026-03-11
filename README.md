@@ -109,17 +109,12 @@ pip install -e .
 uv tool install nanobot-ai
 ```
 
-**Install with Homebrew** (tap + managed service support)
+**Install with Homebrew from this clone** (managed service support, no PyPI required)
 
 ```bash
-brew tap HKUDS/nanobot https://github.com/HKUDS/nanobot
-brew install HKUDS/nanobot/nanobot
-```
-
-**Install from PyPI** (stable)
-
-```bash
-pip install nanobot-ai
+git clone https://github.com/HKUDS/nanobot.git
+cd nanobot
+python3 scripts/install_homebrew_from_clone.py
 ```
 
 ## 🚀 Quick Start
@@ -1106,13 +1101,14 @@ If you edit the `.service` file itself, run `systemctl --user daemon-reload` bef
 
 ## 🍺 Homebrew Service
 
-If you install from the Homebrew tap, you can let Homebrew manage `nanobot gateway` for you.
+If you install from a local clone, you can let Homebrew manage `nanobot gateway` for you.
 
 **1. Install and configure:**
 
 ```bash
-brew tap HKUDS/nanobot https://github.com/HKUDS/nanobot
-brew install HKUDS/nanobot/nanobot
+git clone https://github.com/HKUDS/nanobot.git
+cd nanobot
+python3 scripts/install_homebrew_from_clone.py
 nanobot onboard
 ```
 
@@ -1120,6 +1116,12 @@ nanobot onboard
 
 ```bash
 brew services start nanobot
+```
+
+To refresh the Homebrew install after `git pull`, rerun the installer from the clone:
+
+```bash
+python3 scripts/install_homebrew_from_clone.py --service restart
 ```
 
 **Common operations:**
@@ -1130,16 +1132,6 @@ brew services restart nanobot
 brew services stop nanobot
 tail -f "$(brew --prefix)/var/log/nanobot-gateway.log"
 ```
-
-When this repo publishes a release, the Homebrew formula is refreshed automatically by GitHub Actions. Each machine still needs a local update step to pull the new release, and a running Homebrew service still needs a restart unless you are using Homebrew Bundle with `restart_service`, for example:
-
-```bash
-brew update
-brew upgrade nanobot
-brew services restart nanobot
-```
-
-If you apply installs with Homebrew Bundle, `restart_service: :changed` can restart the service automatically after that local bundle run.
 
 ## 📁 Project Structure
 

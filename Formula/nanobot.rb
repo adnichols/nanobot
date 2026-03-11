@@ -513,6 +513,11 @@ class Nanobot < Formula
     sha256 "a07157588a12518c9d4034df3fbbee09c814741a33ff63c05fa29d26a2404166"
   end
 
+  resource "agent-client-protocol" do
+  url "https://files.pythonhosted.org/packages/1b/7b/7cdac86db388809d9e3bc58cac88cc7dfa49b7615b98fab304a828cd7f8a/agent_client_protocol-0.8.1.tar.gz"
+  sha256 "1bbf15663bf51f64942597f638e32a6284c5da918055d9672d3510e965143dbd"
+  end
+
   def install
     virtualenv_install_with_resources
   end
