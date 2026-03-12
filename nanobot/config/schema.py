@@ -203,6 +203,28 @@ class ChannelsConfig(Base):
 
     send_progress: bool = True  # stream agent's text progress to the channel
     send_tool_hints: bool = False  # stream tool-call hints (e.g. read_file("…"))
+    acp_stream_content: bool = False  # stream live ACP assistant content chunks
+    acp_show_thinking: bool = False  # show ACP reasoning/thinking updates
+    acp_show_tool_calls: bool = False  # show ACP tool call lifecycle updates
+    acp_show_tool_results: bool = False  # show ACP tool result payloads
+    acp_show_system: bool = False  # show ACP system/status events
+
+    def allows_progress(self, *, tool_hint: bool = False, progress_kind: str = "content") -> bool:
+        """Return whether a progress update should be shown for this channel config."""
+        if tool_hint or progress_kind == "tool_hint":
+            return self.send_tool_hints
+        if not self.send_progress:
+            return False
+        if progress_kind == "thinking":
+            return self.acp_show_thinking
+        if progress_kind == "tool_call":
+            return self.acp_show_tool_calls
+        if progress_kind == "tool_result":
+            return self.acp_show_tool_results
+        if progress_kind == "system":
+            return self.acp_show_system
+        return True
+
     whatsapp: WhatsAppConfig = Field(default_factory=WhatsAppConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
@@ -377,6 +399,9 @@ class ACPConfig(Base):
 
     agents: dict[str, ACPAgentDefinition] = Field(default_factory=dict)  # Agent definitions
     default_agent: str | None = None  # Default agent to use when none specified
+    allow_local_fallback: bool = (
+        False  # Allow ACP-selected sessions to fall back to nanobot's local loop on ACP failure
+    )
     permission_policies: dict[str, str] = Field(default_factory=dict)  # Default permission policies
     capabilities: dict[str, list[str]] = Field(default_factory=dict)  # Capability declarations
     process_settings: ACPProcessSettings = Field(default_factory=ACPProcessSettings)

@@ -394,28 +394,36 @@ def _extract_update(update: Any) -> dict[str, Any]:
         return {}
 
     result: dict[str, Any] = {}
-
     data = _as_dict(update)
 
     session_update = _first(data, "session_update", "sessionUpdate")
     if session_update is not None:
         result["session_update"] = _extract_session_update(session_update)
 
-    for key in (
-        "availableCommands",
-        "used",
-        "size",
-        "cost",
-        "content",
-        "message",
-        "toolCall",
-        "toolResult",
-        "thought",
-        "usage",
-    ):
-        value = _first(data, key)
+    scalar_fields = {
+        "available_commands": ("available_commands", "availableCommands"),
+        "used": ("used",),
+        "size": ("size",),
+        "cost": ("cost",),
+        "content": ("content",),
+        "message": ("message",),
+        "tool_call": ("tool_call", "toolCall"),
+        "tool_result": ("tool_result", "toolResult"),
+        "thought": ("thought",),
+        "usage": ("usage",),
+        "tool_call_id": ("tool_call_id", "toolCallId"),
+        "status": ("status",),
+        "title": ("title",),
+        "kind": ("kind",),
+        "raw_input": ("raw_input", "rawInput"),
+        "raw_output": ("raw_output", "rawOutput"),
+        "locations": ("locations",),
+    }
+
+    for output_key, aliases in scalar_fields.items():
+        value = _first(data, *aliases)
         if value is not None:
-            result[key] = value
+            result[output_key] = value
 
     return result
 
@@ -433,25 +441,35 @@ def _extract_session_update(session_update: Any) -> dict[str, Any]:
 
     data = _as_dict(session_update)
 
-    thought = _first(data, "thought")
-    if thought is not None:
-        result["thought"] = thought
+    scalar_fields = {
+        "kind": ("kind",),
+        "thought": ("thought",),
+        "tool_call": ("tool_call", "toolCall"),
+        "tool_result": ("tool_result", "toolResult"),
+        "usage": ("usage",),
+        "tool_call_id": ("tool_call_id", "toolCallId"),
+        "status": ("status",),
+        "title": ("title",),
+        "raw_input": ("raw_input", "rawInput"),
+        "raw_output": ("raw_output", "rawOutput"),
+        "locations": ("locations",),
+        "content": ("content",),
+    }
+
+    for output_key, aliases in scalar_fields.items():
+        value = _first(data, *aliases)
+        if value is None:
+            continue
+        if output_key == "message":
+            result[output_key] = _extract_message_chunk(value)
+        elif output_key == "usage":
+            result[output_key] = _extract_usage(value)
+        else:
+            result[output_key] = value
 
     message = _first(data, "message")
     if message is not None:
         result["message"] = _extract_message_chunk(message)
-
-    tool_call = _first(data, "tool_call", "toolCall")
-    if tool_call is not None:
-        result["tool_call"] = tool_call
-
-    tool_result = _first(data, "tool_result", "toolResult")
-    if tool_result is not None:
-        result["tool_result"] = tool_result
-
-    usage = _first(data, "usage")
-    if usage is not None:
-        result["usage"] = _extract_usage(usage)
 
     return result
 

@@ -152,7 +152,7 @@ async def test_opencode_jsonrpc():
         try:
             process.stdin.close()
             await process.wait()
-        except:
+        except Exception:
             pass
 
 

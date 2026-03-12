@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import shutil
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
+
+from tests.acp.fakes import FakeACPUpdateSink
 
 
 def should_run_real_tests() -> bool:
@@ -74,6 +76,706 @@ class TestSDKTypesConversions:
             "cwd": "/workspace/project",
             "mcpServers": [],
         }
+
+
+@pytest.mark.asyncio
+async def test_handler_converts_structured_updates_to_internal_events():
+    import asyncio
+
+    from nanobot.acp.sdk_client import SDKNotificationHandler
+
+    update_sink = MagicMock()
+    update_sink.send_update = AsyncMock()
+    handler = SDKNotificationHandler(update_sink=update_sink)
+
+    await handler(
+        "session/update",
+        {
+            "sessionId": "sess-123",
+            "update": {
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {"type": "text", "text": "Thinking..."},
+            },
+        },
+        True,
+    )
+    await handler(
+        "session/update",
+        {
+            "sessionId": "sess-123",
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tool-123",
+                "title": "read",
+                "status": "completed",
+                "content": [
+                    {
+                        "type": "content",
+                        "content": {"type": "text", "text": "done"},
+                    }
+                ],
+                "rawInput": {"path": "/tmp/test.txt"},
+            },
+        },
+        True,
+    )
+
+    await asyncio.sleep(0)
+
+    events = [call.args[0] for call in update_sink.send_update.await_args_list]
+    assert len(events) == 2
+    assert events[0].event_type == "agent_thought_chunk"
+    assert events[0].payload["content"] == "Thinking..."
+    assert events[1].event_type == "tool_result"
+    assert events[1].payload["tool_name"] == "read"
+    assert events[1].payload["content"] == "done"
+    assert events[1].payload["tool_input"] == {"path": "/tmp/test.txt"}
+
+
+@pytest.mark.asyncio
+async def test_permission_decision_is_sent_back_over_sdk_connection():
+    from nanobot.acp.sdk_client import SDKNotificationHandler
+    from nanobot.acp.types import ACPFilesystemCallback, ACPPermissionDecision
+
+    connection = MagicMock()
+    connection.send_notification = AsyncMock()
+    permission_broker = MagicMock()
+    permission_broker.request_permission = AsyncMock(
+        return_value=ACPPermissionDecision(
+            request_id="perm-1",
+            granted=True,
+            reason="Allowed by policy",
+        )
+    )
+    update_sink = FakeACPUpdateSink()
+    handler = SDKNotificationHandler(
+        update_sink=update_sink,
+        permission_broker=permission_broker,
+    )
+    handler.bind_connection(connection)
+
+    response = await handler._handle_permission_request(
+        {
+            "session_id": "sess-123",
+            "request_id": "perm-1",
+            "permission_type": "filesystem",
+            "description": "Read README",
+            "resource": "/workspace/README.md",
+            "options": [
+                {
+                    "optionId": "allow-once",
+                    "kind": "allow_once",
+                    "name": "Allow once",
+                },
+                {
+                    "optionId": "reject-once",
+                    "kind": "reject_once",
+                    "name": "Reject",
+                },
+            ],
+        }
+    )
+
+    connection.send_notification.assert_not_awaited()
+    assert response == {
+        "outcome": {
+            "outcome": "selected",
+            "optionId": "allow-once",
+        }
+    }
+    broker_request = permission_broker.request_permission.await_args.args[0]
+    assert isinstance(broker_request.callback, ACPFilesystemCallback)
+    assert broker_request.callback.operation == "read"
+    assert broker_request.callback.path == "/workspace/README.md"
+    assert [event.event_type for event in update_sink.updates] == [
+        "permission_request",
+        "permission_decision",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_notification_permission_decision_uses_notification_transport():
+    import asyncio
+
+    from nanobot.acp.sdk_client import SDKNotificationHandler
+    from nanobot.acp.types import ACPPermissionDecision
+
+    connection = MagicMock()
+    connection.send_notification = AsyncMock()
+    permission_broker = MagicMock()
+    permission_broker.request_permission = AsyncMock(
+        return_value=ACPPermissionDecision(
+            request_id="perm-1",
+            granted=True,
+            reason="Allowed by policy",
+        )
+    )
+    handler = SDKNotificationHandler(permission_broker=permission_broker)
+    handler.bind_connection(connection)
+
+    await handler(
+        "session/request_permission",
+        {
+            "session_id": "sess-123",
+            "request_id": "perm-1",
+            "permission_type": "filesystem",
+            "description": "Read README",
+            "resource": "/workspace/README.md",
+            "options": [
+                {
+                    "optionId": "allow-once",
+                    "kind": "allow_once",
+                    "name": "Allow once",
+                }
+            ],
+        },
+        True,
+    )
+    await asyncio.sleep(0)
+
+    connection.send_notification.assert_awaited_once_with(
+        "session/request_permission",
+        {
+            "outcome": {
+                "outcome": "selected",
+                "optionId": "allow-once",
+            },
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_filesystem_and_terminal_request_handlers_return_protocol_shapes(tmp_path):
+    from nanobot.acp.fs import ACPFilesystemHandler
+    from nanobot.acp.sdk_client import SDKNotificationHandler
+
+    connection = MagicMock()
+    connection.send_notification = AsyncMock()
+
+    read_path = tmp_path / "README.md"
+    read_path.write_text("line 1\nline 2\n")
+
+    filesystem_handler = ACPFilesystemHandler(workspace=tmp_path, restrict_to_workspace=True)
+
+    terminal_manager = MagicMock()
+    terminal_manager.create = AsyncMock(return_value="term-123")
+
+    handler = SDKNotificationHandler(
+        filesystem_handler=filesystem_handler,
+        terminal_manager=terminal_manager,
+    )
+    handler.bind_connection(connection)
+
+    fs_response = await handler._handle_fs_read(
+        {
+            "session_id": "sess-123",
+            "request_id": "fs-1",
+            "path": str(read_path),
+            "line": 1,
+            "limit": 1,
+        }
+    )
+    terminal_response = await handler._handle_terminal_create(
+        {
+            "session_id": "sess-123",
+            "request_id": "term-1",
+            "command": "echo",
+            "args": ["hello"],
+            "cwd": "/workspace",
+            "env": [{"name": "FOO", "value": "bar"}],
+        }
+    )
+
+    assert fs_response == {"content": "line 1"}
+    assert terminal_response == {"terminalId": "term-123"}
+    connection.send_notification.assert_not_awaited()
+    terminal_manager.create.assert_awaited_once_with(
+        ["echo", "hello"],
+        working_directory="/workspace",
+        environment={"FOO": "bar"},
+        output_byte_limit=None,
+        permission_checked=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_terminal_lifecycle_requests_are_supported():
+    from nanobot.acp.sdk_client import SDKNotificationHandler
+
+    terminal_manager = MagicMock()
+    terminal_manager.output = AsyncMock(return_value="hello")
+    terminal_manager.wait_for_exit = AsyncMock(return_value=0)
+    terminal_manager.kill = AsyncMock(return_value=None)
+    terminal_manager.release = AsyncMock(return_value=None)
+
+    handler = SDKNotificationHandler(terminal_manager=terminal_manager)
+
+    assert await handler("terminal/output", {"terminalId": "term-123"}, False) == {
+        "output": "hello",
+        "truncated": False,
+    }
+    assert await handler("terminal/wait_for_exit", {"terminalId": "term-123"}, False) == {
+        "exitCode": 0
+    }
+    assert await handler("terminal/kill", {"terminalId": "term-123"}, False) == {}
+    assert await handler("terminal/release", {"terminalId": "term-123"}, False) == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "operation"),
+    [
+        ("terminal/output", "output"),
+        ("terminal/wait_for_exit", "wait_for_exit"),
+        ("terminal/kill", "kill"),
+        ("terminal/release", "release"),
+    ],
+)
+async def test_invalid_terminal_lifecycle_requests_raise_protocol_errors(method, operation):
+    from acp.exceptions import RequestError
+
+    from nanobot.acp.sdk_client import SDKNotificationHandler
+    from nanobot.acp.terminal import ACPInvalidTerminalError
+
+    terminal_manager = MagicMock()
+    setattr(
+        terminal_manager,
+        operation,
+        AsyncMock(side_effect=ACPInvalidTerminalError("term-missing", "Terminal does not exist")),
+    )
+    handler = SDKNotificationHandler(terminal_manager=terminal_manager)
+
+    with pytest.raises(RequestError) as exc_info:
+        await handler(method, {"terminalId": "term-missing"}, False)
+
+    assert exc_info.value.code == -32602
+    assert exc_info.value.data == {
+        "terminalId": "term-missing",
+        "operation": operation,
+        "reason": "Invalid terminal: term-missing - Terminal does not exist",
+    }
+
+
+@pytest.mark.asyncio
+async def test_terminal_wait_timeout_returns_protocol_error():
+    import asyncio
+
+    from acp.exceptions import RequestError
+
+    from nanobot.acp.sdk_client import SDKNotificationHandler
+
+    terminal_manager = MagicMock()
+    terminal_manager.wait_for_exit = AsyncMock(
+        side_effect=asyncio.TimeoutError("Terminal term-123 did not exit within 5 seconds")
+    )
+    handler = SDKNotificationHandler(terminal_manager=terminal_manager)
+
+    with pytest.raises(RequestError) as exc_info:
+        await handler("terminal/wait_for_exit", {"terminalId": "term-123"}, False)
+
+    assert exc_info.value.code == -32602
+    assert exc_info.value.data == {
+        "terminalId": "term-123",
+        "operation": "wait_for_exit",
+        "reason": "Terminal term-123 did not exit within 5 seconds",
+    }
+
+
+def test_sdk_client_can_clear_update_subscription():
+    from nanobot.acp.sdk_client import SDKClient, SDKNotificationHandler
+
+    sink = MagicMock()
+    client = SDKClient(agent_path=None)
+    client.subscribe_updates(sink)
+
+    handler = SDKNotificationHandler(update_sink=sink)
+    client._notification_handler = handler
+
+    client.clear_update_subscription()
+
+    assert client._update_sink is None
+    assert handler._update_sink is None
+
+
+@pytest.mark.asyncio
+async def test_denied_filesystem_request_raises_protocol_error(tmp_path):
+    from acp.exceptions import RequestError
+
+    from nanobot.acp.fs import ACPFilesystemHandler
+    from nanobot.acp.sdk_client import SDKNotificationHandler
+
+    filesystem_handler = ACPFilesystemHandler(workspace=tmp_path, restrict_to_workspace=True)
+    handler = SDKNotificationHandler(filesystem_handler=filesystem_handler)
+
+    with pytest.raises(RequestError) as exc_info:
+        await handler._handle_fs_read(
+            {
+                "session_id": "sess-123",
+                "request_id": "fs-1",
+                "path": "/tmp/outside-workspace.txt",
+            }
+        )
+
+    assert exc_info.value.code == -32602
+    assert exc_info.value.data == {
+        "path": "/tmp/outside-workspace.txt",
+        "operation": "read",
+        "reason": f"Path /tmp/outside-workspace.txt is outside allowed directory {tmp_path}",
+    }
+
+
+@pytest.mark.asyncio
+async def test_large_filesystem_request_returns_protocol_denial_instead_of_crashing(tmp_path):
+    from acp.exceptions import RequestError
+
+    from nanobot.acp.fs import ACPFilesystemHandler
+    from nanobot.acp.sdk_client import SDKNotificationHandler
+
+    large_file = tmp_path / "large.txt"
+    large_file.write_text("x" * (ACPFilesystemHandler._MAX_CHARS * 4 + 1))
+
+    filesystem_handler = ACPFilesystemHandler(workspace=tmp_path, restrict_to_workspace=True)
+    handler = SDKNotificationHandler(filesystem_handler=filesystem_handler)
+
+    with pytest.raises(RequestError) as exc_info:
+        await handler._handle_fs_read(
+            {
+                "session_id": "sess-123",
+                "request_id": "fs-large-1",
+                "path": str(large_file),
+            }
+        )
+
+    assert exc_info.value.code == -32602
+    assert exc_info.value.data == {
+        "path": str(large_file),
+        "operation": "read",
+        "reason": (
+            f"File too large ({large_file.stat().st_size:,} bytes). "
+            "Use exec tool with head/tail/grep to read portions."
+        ),
+    }
+
+
+@pytest.mark.asyncio
+async def test_ask_mode_direct_filesystem_callbacks_do_not_bypass_permission_broker(tmp_path):
+    from acp.exceptions import RequestError
+
+    from nanobot.acp.fs import ACPFilesystemHandler
+    from nanobot.acp.permissions import ACPCallbackRouter, PermissionBrokerFactory
+    from nanobot.acp.sdk_client import SDKNotificationHandler
+
+    read_path = tmp_path / "README.md"
+    read_path.write_text("hello")
+
+    callback_registry = ACPCallbackRouter()
+    permission_broker = PermissionBrokerFactory.create_for_session(
+        "telegram:123",
+        agent_policy="ask",
+        callback_registry=callback_registry,
+        timeout=0.01,
+    )
+    handler = SDKNotificationHandler(
+        permission_broker=permission_broker,
+        filesystem_handler=ACPFilesystemHandler(workspace=tmp_path, restrict_to_workspace=True),
+    )
+
+    with pytest.raises(RequestError) as exc_info:
+        await handler._handle_fs_read(
+            {
+                "session_id": "sess-123",
+                "request_id": "fs-ask-1",
+                "path": str(read_path),
+            }
+        )
+
+    assert exc_info.value.code == -32602
+    assert exc_info.value.data == {
+        "path": str(read_path),
+        "operation": "read",
+        "reason": "No handler registered for permission type",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method_name", "payload", "expected"),
+    [
+        (
+            "_handle_fs_read",
+            lambda path: {"session_id": "sess-123", "request_id": "fs-read-1", "path": path},
+            lambda path: {"path": path, "operation": "read"},
+        ),
+        (
+            "_handle_fs_write",
+            lambda path: {
+                "session_id": "sess-123",
+                "request_id": "fs-write-1",
+                "path": path,
+                "content": "demo",
+            },
+            lambda path: {"path": path, "operation": "write"},
+        ),
+    ],
+)
+async def test_granted_broker_still_returns_filesystem_handler_denials(
+    tmp_path, method_name, payload, expected
+):
+    from acp.exceptions import RequestError
+
+    from nanobot.acp.fs import ACPFilesystemHandler
+    from nanobot.acp.sdk_client import SDKNotificationHandler
+    from nanobot.acp.types import ACPPermissionDecision
+
+    permission_broker = MagicMock()
+    permission_broker.request_permission = AsyncMock(
+        return_value=ACPPermissionDecision(
+            request_id="perm-allow",
+            granted=True,
+            reason="Allowed by trusted policy",
+        )
+    )
+    handler = SDKNotificationHandler(
+        permission_broker=permission_broker,
+        filesystem_handler=ACPFilesystemHandler(workspace=tmp_path, restrict_to_workspace=True),
+    )
+
+    outside_path = "/tmp/outside-workspace.txt"
+
+    with pytest.raises(RequestError) as exc_info:
+        await getattr(handler, method_name)(payload(outside_path))
+
+    assert exc_info.value.code == -32602
+    assert exc_info.value.data == {
+        **expected(outside_path),
+        "reason": f"Path {outside_path} is outside allowed directory {tmp_path}",
+    }
+
+
+@pytest.mark.asyncio
+async def test_deny_mode_terminal_callbacks_do_not_bypass_permission_broker(tmp_path):
+    from acp.exceptions import RequestError
+
+    from nanobot.acp.permissions import ACPCallbackRouter, PermissionBrokerFactory
+    from nanobot.acp.sdk_client import SDKNotificationHandler
+    from nanobot.acp.terminal import ACPTerminalManager
+
+    callback_registry = ACPCallbackRouter()
+    permission_broker = PermissionBrokerFactory.create_for_session(
+        "telegram:123",
+        agent_policy="deny",
+        callback_registry=callback_registry,
+    )
+    terminal_manager = ACPTerminalManager(callback_registry=callback_registry)
+    handler = SDKNotificationHandler(
+        permission_broker=permission_broker,
+        terminal_manager=terminal_manager,
+    )
+
+    with pytest.raises(RequestError) as exc_info:
+        await handler._handle_terminal_create(
+            {
+                "session_id": "sess-123",
+                "request_id": "term-deny-1",
+                "command": "echo",
+                "args": ["hello"],
+                "cwd": str(tmp_path),
+            }
+        )
+
+    assert exc_info.value.code == -32602
+    assert exc_info.value.data == {
+        "command": "echo hello",
+        "reason": "Denied by trusted interactive policy (action: terminal:echo hello)",
+    }
+
+
+@pytest.mark.asyncio
+async def test_denied_permission_still_emits_updates_and_returns_notification():
+    import asyncio
+
+    from nanobot.acp.sdk_client import SDKNotificationHandler
+    from nanobot.acp.types import ACPPermissionDecision
+
+    connection = MagicMock()
+    connection.send_notification = AsyncMock()
+    permission_broker = MagicMock()
+    permission_broker.request_permission = AsyncMock(
+        side_effect=[
+            ACPPermissionDecision(
+                request_id="perm-allow",
+                granted=True,
+                reason="Approved",
+            ),
+            ACPPermissionDecision(
+                request_id="perm-deny",
+                granted=False,
+                reason="Denied by policy",
+            ),
+        ]
+    )
+    update_sink = FakeACPUpdateSink()
+    handler = SDKNotificationHandler(
+        update_sink=update_sink,
+        permission_broker=permission_broker,
+    )
+    handler.bind_connection(connection)
+
+    options = [
+        {
+            "optionId": "allow-once",
+            "kind": "allow_once",
+            "name": "Allow once",
+        },
+        {
+            "optionId": "reject-once",
+            "kind": "reject_once",
+            "name": "Reject",
+        },
+    ]
+
+    await handler(
+        "session/request_permission",
+        {
+            "session_id": "sess-allow",
+            "request_id": "perm-allow",
+            "permission_type": "terminal",
+            "description": "Run pytest",
+            "resource": "pytest",
+            "options": options,
+        },
+        True,
+    )
+    await handler(
+        "session/request_permission",
+        {
+            "session_id": "sess-deny",
+            "request_id": "perm-deny",
+            "permission_type": "terminal",
+            "description": "Run rm -rf",
+            "resource": "rm -rf /tmp/demo",
+            "options": options,
+        },
+        True,
+    )
+    await asyncio.sleep(0)
+
+    assert connection.send_notification.await_args_list == [
+        call(
+            "session/request_permission",
+            {
+                "outcome": {
+                    "outcome": "selected",
+                    "optionId": "allow-once",
+                },
+            },
+        ),
+        call(
+            "session/request_permission",
+            {
+                "outcome": {"outcome": "cancelled"},
+            },
+        ),
+    ]
+    assert [event.event_type for event in update_sink.updates] == [
+        "permission_request",
+        "permission_decision",
+        "permission_request",
+        "permission_decision",
+    ]
+    assert update_sink.updates[-1].payload == {
+        "session_id": "sess-deny",
+        "granted": False,
+        "reason": "Denied by policy",
+    }
+
+
+@pytest.mark.asyncio
+async def test_terminal_manager_preserves_process_environment(monkeypatch):
+    from nanobot.acp.terminal import ACPTerminalManager
+
+    captured: dict[str, Any] = {}
+
+    class FakeProcess:
+        stdout = None
+        stderr = None
+        returncode = 0
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        captured["command"] = command
+        captured["cwd"] = kwargs["cwd"]
+        captured["env"] = kwargs["env"]
+        return FakeProcess()
+
+    monkeypatch.setenv("PATH", "/bin:/usr/bin")
+    monkeypatch.setattr(
+        "nanobot.acp.terminal.asyncio.create_subprocess_exec", fake_create_subprocess_exec
+    )
+
+    manager = ACPTerminalManager()
+    terminal_id = await manager.create(
+        command=["echo", "hello"],
+        working_directory="/tmp",
+        environment={"FOO": "bar"},
+    )
+
+    assert terminal_id.startswith("term-")
+    assert captured["command"] == ("echo", "hello")
+    assert captured["cwd"] == "/tmp"
+    assert captured["env"]["FOO"] == "bar"
+    assert captured["env"]["PATH"] == "/bin:/usr/bin"
+
+
+@pytest.mark.asyncio
+async def test_initialize_advertises_filesystem_and_terminal_capabilities(monkeypatch):
+    from nanobot.acp.sdk_client import SDKClient
+
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.requests: list[tuple[str, dict[str, Any]]] = []
+
+        async def send_request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            self.requests.append((method, params))
+            if method == "initialize":
+                return {
+                    "protocolVersion": 1,
+                    "agentCapabilities": {"loadSession": True},
+                    "agentInfo": {"name": "OpenCode", "version": "1.2.24"},
+                }
+            raise AssertionError(f"Unexpected request: {method}")
+
+    fake_connection = FakeConnection()
+    client = SDKClient(
+        agent_path="opencode",
+        args=["acp"],
+        filesystem_handler=object(),
+        terminal_manager=object(),
+    )
+    client._spawn_connection = AsyncMock(return_value=(fake_connection, "process"))
+    monkeypatch.setattr(
+        "nanobot.acp.sdk_client.to_sdk_initialize_params",
+        lambda _request: {
+            "protocolVersion": 1,
+            "clientCapabilities": {},
+            "clientInfo": {"name": "nanobot", "version": "0.1.0"},
+        },
+    )
+
+    await client.initialize(session_id="debug-session")
+
+    assert fake_connection.requests == [
+        (
+            "initialize",
+            {
+                "protocolVersion": 1,
+                "clientCapabilities": {
+                    "fs": {"readTextFile": True, "writeTextFile": True},
+                    "terminal": True,
+                },
+                "clientInfo": {"name": "nanobot", "version": "0.1.0"},
+            },
+        )
+    ]
 
 
 class TestSDKClientBasic:
@@ -215,9 +917,15 @@ class TestSDKClientSpawn:
         from nanobot.acp.types import ACPStreamChunkType
 
         sleep_calls: list[float] = []
+        live_chunks: list[str] = []
+        prompt_completed = False
 
         async def fake_sleep(delay: float) -> None:
             sleep_calls.append(delay)
+
+        async def on_chunk(text: str) -> None:
+            assert prompt_completed is False
+            live_chunks.append(text)
 
         class FakeConnection:
             def __init__(self) -> None:
@@ -237,6 +945,7 @@ class TestSDKClientSpawn:
                 if method == "session/set_model":
                     return {"_meta": {"opencode": {"modelId": params["modelId"]}}}
                 if method == "session/prompt":
+                    assert live_chunks == []
                     assert client._notification_handler is not None
                     await client._notification_handler(
                         "session/update",
@@ -249,6 +958,7 @@ class TestSDKClientSpawn:
                         },
                         True,
                     )
+                    assert live_chunks == ["Hello"]
                     return {"stopReason": "end_turn", "usage": {"totalTokens": 0}}
                 raise AssertionError(f"Unexpected request: {method}")
 
@@ -269,7 +979,9 @@ class TestSDKClientSpawn:
         assert client.current_session_id == "sess-123"
 
         await client.set_model("openai/gpt-5.4")
-        prompt_result = await client.prompt("Hello")
+        prompt_result = await client.prompt("Hello", on_chunk=on_chunk)
+        prompt_completed = True
+        assert live_chunks == ["Hello"]
         assert [chunk.type for chunk in prompt_result] == [ACPStreamChunkType.CONTENT_DELTA]
         assert [chunk.content for chunk in prompt_result] == ["Hello"]
         assert sleep_calls and sleep_calls[0] > 0
@@ -302,6 +1014,58 @@ class TestSDKClientSpawn:
             ),
         ]
         assert fake_connection.notifications == [("session/cancel", {"sessionId": "sess-123"})]
+
+    @pytest.mark.asyncio
+    async def test_notification_handler_ignores_empty_or_non_text_chunks(self):
+        """SDKNotificationHandler only streams non-empty text chunks to live callbacks."""
+        from nanobot.acp.sdk_client import SDKNotificationHandler
+
+        received: list[str] = []
+
+        async def on_chunk(text: str) -> None:
+            received.append(text)
+
+        handler = SDKNotificationHandler()
+        handler.begin_stream("sess-123", on_chunk=on_chunk)
+
+        await handler(
+            "session/update",
+            {
+                "sessionId": "sess-123",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "image", "data": "ignored"},
+                },
+            },
+            True,
+        )
+        await handler(
+            "session/update",
+            {
+                "sessionId": "sess-123",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": ""},
+                },
+            },
+            True,
+        )
+        await handler(
+            "session/update",
+            {
+                "sessionId": "sess-123",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "Hello"},
+                },
+            },
+            True,
+        )
+
+        buffered = handler.take_stream_chunks("sess-123")
+
+        assert received == ["Hello"]
+        assert [chunk.content for chunk in buffered] == ["Hello"]
 
 
 class TestSDKClientReal:

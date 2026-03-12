@@ -103,6 +103,31 @@ cd nanobot
 pip install -e .
 ```
 
+**Development and test setup**
+
+Use `uv` for contributor workflows and local quality gates:
+
+```bash
+git clone https://github.com/HKUDS/nanobot.git
+cd nanobot
+uv sync --extra dev
+```
+
+Run the repo-truth checks with:
+
+```bash
+uv run ruff check .
+uv run pytest
+```
+
+The `dev` extra intentionally installs the default test dependencies without Matrix E2EE native build requirements, so `uv sync --extra dev` is the canonical path for local lint + pytest runs.
+
+If you specifically need Matrix encrypted-room support, install the full Matrix runtime extra as well. On some Python 3.14 environments that path may still require an additional compiler/toolchain because `matrix-nio[e2e]` pulls `python-olm`:
+
+```bash
+uv sync --extra dev --extra matrix
+```
+
 **Install with [uv](https://github.com/astral-sh/uv)** (stable, fast)
 
 ```bash
@@ -323,6 +348,8 @@ Install Matrix dependencies first:
 ```bash
 pip install nanobot-ai[matrix]
 ```
+
+For contributor test runs, `uv sync --extra dev` is sufficient for the current Matrix test suite. Use the `matrix` extra when you need the full encrypted Matrix runtime locally.
 
 **1. Create/choose a Matrix account**
 
@@ -955,6 +982,8 @@ NANOBOT_TEST_OPENCODE=1 uv run pytest tests/acp/test_acceptance_opencode.py -v -
 ```
 
 These tests are opt-in to keep the default test suite hermetic.
+
+Matrix channel tests are part of the default `uv run pytest` suite, and `uv sync --extra dev` installs the required test-time Matrix packages (`nh3`, `mistune`, `matrix-nio`). Add `--extra matrix` when you also need the full encrypted Matrix runtime locally.
 
 
 ### Security

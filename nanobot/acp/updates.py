@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from nanobot.acp.interfaces import ACPUpdateSink
 from nanobot.acp.types import (
@@ -20,6 +20,8 @@ from nanobot.acp.types import (
     ACPStreamChunkType,
     ACPUpdateEvent,
 )
+
+ProgressUpdateCallback = Callable[["ACPProgressUpdate"], Awaitable[None]]
 
 
 @dataclass
@@ -30,6 +32,37 @@ class AccumulatedUpdate:
     timestamp: datetime
     content: str
     correlation_id: Optional[str] = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ACPProgressVisibility:
+    """Visibility controls for ACP progress categories."""
+
+    show_thinking: bool = False
+    show_tool_calls: bool = False
+    show_tool_results: bool = False
+    show_system: bool = False
+
+    def allows(self, kind: str) -> bool:
+        """Return whether a progress kind should be emitted."""
+        if kind == "thinking":
+            return self.show_thinking
+        if kind == "tool_call":
+            return self.show_tool_calls
+        if kind == "tool_result":
+            return self.show_tool_results
+        if kind == "system":
+            return self.show_system
+        return True
+
+
+@dataclass(frozen=True)
+class ACPProgressUpdate:
+    """A user-visible ACP progress update after filtering and classification."""
+
+    kind: str
+    content: str
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -160,6 +193,23 @@ class ACPUpdateAccumulator:
             except Exception:
                 pass
 
+    def progress_for_event(
+        self,
+        event: ACPUpdateEvent,
+        visibility: ACPProgressVisibility | None = None,
+    ) -> ACPProgressUpdate | None:
+        """Convert an event to a filtered, user-visible progress update."""
+        kind = self._progress_kind_for_event(event)
+        visible = visibility or ACPProgressVisibility()
+        if not visible.allows(kind):
+            return None
+
+        content = self._generate_content(event).strip()
+        if not content:
+            return None
+
+        return ACPProgressUpdate(kind=kind, content=content, metadata=event.payload)
+
     def _get_accumulation_key(self, event: ACPUpdateEvent) -> str:
         """Get the key for accumulating this event.
 
@@ -194,6 +244,20 @@ class ACPUpdateAccumulator:
             metadata=event.payload,
         )
 
+    @staticmethod
+    def _progress_kind_for_event(event: ACPUpdateEvent) -> str:
+        """Classify an event into a gateway-level progress visibility bucket."""
+        event_type = event.event_type
+        if event_type == "agent_thought_chunk":
+            return "thinking"
+        if event_type in {"tool_use_start", "tool_use_end"}:
+            return "tool_call"
+        if event_type in {"tool_result", "tool_result_start", "tool_result_end"}:
+            return "tool_result"
+        if event_type in {"content_chunk", "prompt_start", "prompt_end", "error"}:
+            return "content"
+        return "system"
+
     def _generate_content(self, event: ACPUpdateEvent) -> str:
         """Generate display content for an event.
 
@@ -217,6 +281,11 @@ class ACPUpdateAccumulator:
             return f"Processing: {content[:50]}..."
         elif event_type == "prompt_end":
             return "Response complete"
+        elif event_type == "content_chunk":
+            return payload.get("content", "")
+        elif event_type == "agent_thought_chunk":
+            thought = payload.get("content") or payload.get("thought", "")
+            return str(thought)
         elif event_type == "tool_use_start":
             tool_name = payload.get("tool_name", "unknown")
             return f"Using tool: {tool_name}"
@@ -227,6 +296,13 @@ class ACPUpdateAccumulator:
             tool_name = payload.get("tool_name", "unknown")
             content = payload.get("content", "")
             return f"{tool_name}: {content[:100]}"
+        elif event_type == "tool_result_start":
+            tool_name = payload.get("tool_name", "unknown")
+            return f"{tool_name}: running"
+        elif event_type == "tool_result_end":
+            tool_name = payload.get("tool_name", "unknown")
+            content = payload.get("content", "")
+            return f"{tool_name}: {content[:100]}" if content else f"{tool_name}: complete"
         elif event_type == "permission_request":
             perm_type = payload.get("permission_type", "unknown")
             desc = payload.get("description", "")
@@ -239,6 +315,8 @@ class ACPUpdateAccumulator:
             return "Operation cancelled"
         elif event_type == "shutdown":
             return "Agent shutting down"
+        elif event_type == "system_notice":
+            return str(payload.get("content", "")).strip()
         else:
             return f"Event: {event_type}"
 
@@ -303,4 +381,33 @@ class ACPDirectUpdateSink:
 
     async def stream_chunk(self, chunk: ACPStreamChunk) -> None:
         """Stream a chunk to the accumulator."""
+        await self._accumulator.receive_chunk(chunk)
+
+
+class ACPFilteringProgressSink:
+    """ACP update sink that filters runtime events into user-visible progress callbacks."""
+
+    def __init__(
+        self,
+        accumulator: ACPUpdateAccumulator,
+        visibility: ACPProgressVisibility,
+        on_progress: ProgressUpdateCallback,
+    ):
+        self._accumulator = accumulator
+        self._visibility = visibility
+        self._on_progress = on_progress
+
+    async def send_update(self, event: ACPUpdateEvent) -> None:
+        """Accumulate an update and forward it when visibility permits."""
+        await self._accumulator.receive_update(event)
+        progress = self._accumulator.progress_for_event(event, visibility=self._visibility)
+        if progress is not None:
+            await self._on_progress(progress)
+
+    async def send_rendered(self, update: ACPRenderedUpdate) -> None:
+        """Rendered updates are not used by this sink."""
+        pass
+
+    async def stream_chunk(self, chunk: ACPStreamChunk) -> None:
+        """Accumulate a stream chunk for downstream final-answer assembly."""
         await self._accumulator.receive_chunk(chunk)

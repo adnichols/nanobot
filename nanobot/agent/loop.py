@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import re
 import weakref
@@ -68,6 +69,7 @@ class AgentLoop:
         channels_config: ChannelsConfig | None = None,
         acp_service: Any = None,
         acp_default_agent: str | None = None,
+        acp_allow_local_fallback: bool = False,
     ):
         from nanobot.config.schema import ExecToolConfig
 
@@ -88,6 +90,7 @@ class AgentLoop:
         self.restrict_to_workspace = restrict_to_workspace
         self.acp_service = acp_service
         self.acp_default_agent = acp_default_agent
+        self.acp_allow_local_fallback = acp_allow_local_fallback
 
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
@@ -189,30 +192,26 @@ class AgentLoop:
             return False
         return True
 
+    @staticmethod
+    def _is_acp_error_response(response: OutboundMessage | None) -> bool:
+        """Return whether an ACP response represents an ACP-side failure."""
+        return bool(response and response.content.startswith("ACP error:"))
+
     async def _route_to_acp(
         self,
         session_key: str,
         message: str,
-        on_progress: Callable[[str], Awaitable[None]] | None = None,
+        on_progress: Callable[..., Awaitable[None]] | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> OutboundMessage | None:
         """Route a message to the ACP backend instead of local agent.
 
         This handles:
         1. Loading or creating an ACP session for the nanobot session
         2. Sending the prompt to ACP
-        3. Collecting the response and streaming progress
-
-        Args:
-            session_key: The nanobot session key
-            message: The message content
-            on_progress: Optional callback for progress updates
-            channel: Source channel (e.g., 'telegram', 'whatsapp', 'cli')
-            chat_id: Source chat ID to preserve routing
-
-        Returns:
-            OutboundMessage with the response content
+        3. Collecting the response and optionally streaming live progress
         """
         from nanobot.bus.events import OutboundMessage
 
@@ -222,24 +221,81 @@ class AgentLoop:
             )
 
         try:
-            # Load or create ACP session for this nanobot session
             result = await self.acp_service.load_session(session_key)
             acp_session_id = result.get("acp_session_id")
 
             logger.info("Using ACP session {} for nanobot session {}", acp_session_id, session_key)
 
-            # Process the message through ACP
-            chunks = await self.acp_service.process_message(session_key, message)
+            process_message_kwargs: dict[str, Any] = {}
+            channels = self.channels_config
 
-            # Collect the response
-            response_parts = []
-            for chunk in chunks:
-                if chunk.content:
-                    response_parts.append(chunk.content)
-                    if on_progress:
-                        await on_progress(chunk.content)
+            async def on_chunk(chunk_text: str) -> None:
+                await self._emit_progress(
+                    on_progress,
+                    chunk_text,
+                    progress_kind="content",
+                )
 
-            response = "".join(response_parts)
+            live_content_streaming_enabled = bool(
+                on_progress is not None and channels is not None and channels.acp_stream_content
+            )
+            visible_updates_enabled = bool(
+                on_progress is not None
+                and channels is not None
+                and (
+                    channels.acp_show_thinking
+                    or channels.acp_show_tool_calls
+                    or channels.acp_show_tool_results
+                    or channels.acp_show_system
+                )
+            )
+            if visible_updates_enabled:
+                from nanobot.acp.updates import (
+                    ACPFilteringProgressSink,
+                    ACPProgressVisibility,
+                    ACPUpdateAccumulator,
+                )
+
+                assert channels is not None
+
+                async def emit_acp_progress(update: Any) -> None:
+                    await self._emit_progress(
+                        on_progress,
+                        update.content,
+                        progress_kind=update.kind,
+                    )
+
+                visibility = ACPProgressVisibility(
+                    show_thinking=channels.acp_show_thinking,
+                    show_tool_calls=channels.acp_show_tool_calls,
+                    show_tool_results=channels.acp_show_tool_results,
+                    show_system=channels.acp_show_system,
+                )
+                self.acp_service.subscribe_updates(
+                    session_key,
+                    ACPFilteringProgressSink(
+                        accumulator=ACPUpdateAccumulator(),
+                        visibility=visibility,
+                        on_progress=emit_acp_progress,
+                    ),
+                )
+            else:
+                clear_update_subscription = getattr(
+                    self.acp_service,
+                    "clear_update_subscription",
+                    None,
+                )
+                if callable(clear_update_subscription):
+                    clear_update_subscription(session_key)
+            if live_content_streaming_enabled:
+                process_message_kwargs["on_chunk"] = on_chunk
+
+            chunks = await self.acp_service.process_message(
+                session_key,
+                message,
+                **process_message_kwargs,
+            )
+            response = "".join(chunk.content for chunk in chunks if getattr(chunk, "content", None))
             if not response:
                 response = "ACP session completed."
 
@@ -247,6 +303,7 @@ class AgentLoop:
                 channel=channel,
                 chat_id=chat_id,
                 content=response,
+                metadata=metadata or {},
             )
         except Exception as e:
             logger.exception("Error routing to ACP for session {}", session_key)
@@ -254,6 +311,7 @@ class AgentLoop:
                 channel=channel,
                 chat_id=chat_id,
                 content=f"ACP error: {str(e)[:200]}",
+                metadata=metadata or {},
             )
 
     @staticmethod
@@ -275,6 +333,41 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
 
         return ", ".join(_fmt(tc) for tc in tool_calls)
+
+    async def _emit_progress(
+        self,
+        on_progress: Callable[..., Awaitable[None]] | None,
+        content: str | None,
+        *,
+        tool_hint: bool = False,
+        progress_kind: str = "content",
+    ) -> None:
+        """Deliver a progress update while honoring channel visibility config."""
+        if on_progress is None or not content:
+            return
+
+        normalized_kind = "tool_hint" if tool_hint else progress_kind
+        channels = self.channels_config
+        if channels is None:
+            from nanobot.config.schema import ChannelsConfig
+
+            channels = ChannelsConfig()
+        if not channels.allows_progress(
+            tool_hint=tool_hint,
+            progress_kind=normalized_kind,
+        ):
+            return
+
+        signature = inspect.signature(on_progress)
+        accepts_kwargs = any(
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()
+        )
+        kwargs: dict[str, Any] = {}
+        if accepts_kwargs or "tool_hint" in signature.parameters:
+            kwargs["tool_hint"] = tool_hint
+        if accepts_kwargs or "progress_kind" in signature.parameters:
+            kwargs["progress_kind"] = normalized_kind
+        await on_progress(content, **kwargs)
 
     async def _run_agent_loop(
         self,
@@ -300,11 +393,14 @@ class AgentLoop:
             )
 
             if response.has_tool_calls:
-                if on_progress:
-                    clean = self._strip_think(response.content)
-                    if clean:
-                        await on_progress(clean)
-                    await on_progress(self._tool_hint(response.tool_calls), tool_hint=True)
+                clean = self._strip_think(response.content)
+                await self._emit_progress(on_progress, clean)
+                await self._emit_progress(
+                    on_progress,
+                    self._tool_hint(response.tool_calls),
+                    tool_hint=True,
+                    progress_kind="tool_hint",
+                )
 
                 tool_call_dicts = [
                     {
@@ -499,6 +595,27 @@ class AgentLoop:
 
         key = session_key or msg.session_key
 
+        async def _bus_progress(
+            content: str,
+            *,
+            tool_hint: bool = False,
+            progress_kind: str = "content",
+        ) -> None:
+            meta = dict(msg.metadata or {})
+            meta["_progress"] = True
+            meta["_tool_hint"] = tool_hint
+            meta["_progress_kind"] = "tool_hint" if tool_hint else progress_kind
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=content,
+                    metadata=meta,
+                )
+            )
+
+        progress_callback = on_progress or _bus_progress
+
         # Route to ACP if configured for this session
         if self._use_acp_for_session(key):
             # Skip slash commands in ACP mode (they'll be handled by the ACP agent)
@@ -514,34 +631,79 @@ class AgentLoop:
                 # /new in ACP mode - clear ACP session
                 if cmd == "/new":
                     try:
-                        await self.acp_service.shutdown_session(key)
-                    except Exception:
-                        pass
+                        reset_session = getattr(type(self.acp_service), "reset_session", None)
+                        if reset_session is not None:
+                            await reset_session(self.acp_service, key)
+                        else:
+                            await self.acp_service.shutdown_session(key)
+                    except Exception as exc:
+                        logger.exception("Failed to reset ACP session {}", key)
+                        return OutboundMessage(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            content=f"ACP error: {str(exc)[:200]}",
+                            metadata=msg.metadata or {},
+                        )
                     return OutboundMessage(
                         channel=msg.channel,
                         chat_id=msg.chat_id,
                         content="New session started (ACP).",
                     )
 
-            # Route to ACP backend, but fail open to the local agent if ACP hangs or errors.
+            # Route to ACP backend. Local fail-open is opt-in via config.
             try:
                 response = await asyncio.wait_for(
-                    self._route_to_acp(key, msg.content, on_progress, msg.channel, msg.chat_id),
+                    self._route_to_acp(
+                        key,
+                        msg.content,
+                        progress_callback,
+                        msg.channel,
+                        msg.chat_id,
+                        msg.metadata,
+                    ),
                     timeout=self._ACP_ROUTE_TIMEOUT_SECONDS,
                 )
             except asyncio.TimeoutError:
-                logger.warning(
-                    "ACP routing timed out for session {}; falling back to local agent",
-                    key,
-                )
+                logger.warning("ACP routing timed out for session {}", key)
                 if self.acp_service:
                     try:
                         await self.acp_service.cancel_operation(key)
                     except Exception:
                         logger.exception("Failed to cancel timed-out ACP session {}", key)
+                if not self.acp_allow_local_fallback:
+                    return OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content=f"ACP error: timed out after {self._ACP_ROUTE_TIMEOUT_SECONDS:g}s",
+                        metadata=msg.metadata or {},
+                    )
+                logger.warning(
+                    "ACP routing timed out for session {}; falling back to local agent",
+                    key,
+                )
+            except Exception as exc:
+                logger.exception("ACP routing raised for session {}", key)
+                if not self.acp_allow_local_fallback:
+                    return OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content=f"ACP error: {str(exc)[:200]}",
+                        metadata=msg.metadata or {},
+                    )
+                logger.warning(
+                    "ACP routing raised for session {}; falling back to local agent",
+                    key,
+                )
             else:
-                if response and not response.content.startswith("ACP error:"):
+                if response and not self._is_acp_error_response(response):
                     return response
+                if not self.acp_allow_local_fallback:
+                    return response or OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content="ACP error: request failed",
+                        metadata=msg.metadata or {},
+                    )
                 logger.warning(
                     "ACP routing failed for session {}; falling back to local agent",
                     key,
@@ -621,22 +783,9 @@ class AgentLoop:
             chat_id=msg.chat_id,
         )
 
-        async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
-            meta = dict(msg.metadata or {})
-            meta["_progress"] = True
-            meta["_tool_hint"] = tool_hint
-            await self.bus.publish_outbound(
-                OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content=content,
-                    metadata=meta,
-                )
-            )
-
         final_content, _, all_msgs = await self._run_agent_loop(
             initial_messages,
-            on_progress=on_progress or _bus_progress,
+            on_progress=progress_callback,
         )
 
         if final_content is None:

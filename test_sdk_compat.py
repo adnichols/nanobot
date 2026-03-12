@@ -107,13 +107,13 @@ async def test_sdk_compatibility():
         if connection:
             try:
                 await connection.close()
-            except:
+            except Exception:
                 pass
         if process:
             try:
                 process.kill()
                 await process.wait()
-            except:
+            except Exception:
                 pass
 
 

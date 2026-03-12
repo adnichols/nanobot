@@ -215,9 +215,15 @@ class ChannelManager:
                 )
 
                 if msg.metadata.get("_progress"):
-                    if msg.metadata.get("_tool_hint") and not self.config.channels.send_tool_hints:
-                        continue
-                    if not msg.metadata.get("_tool_hint") and not self.config.channels.send_progress:
+                    tool_hint = bool(msg.metadata.get("_tool_hint"))
+                    progress_kind = msg.metadata.get(
+                        "_progress_kind",
+                        "tool_hint" if tool_hint else "content",
+                    )
+                    if not self.config.channels.allows_progress(
+                        tool_hint=tool_hint,
+                        progress_kind=progress_kind,
+                    ):
                         continue
 
                 channel = self.channels.get(msg.channel)

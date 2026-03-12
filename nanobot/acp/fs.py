@@ -11,7 +11,7 @@ and reuses existing repo safety constraints for workspace boundaries.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from nanobot.acp.types import (
     ACPFilesystemCallback,
@@ -97,46 +97,73 @@ class ACPFilesystemHandler:
         Returns:
             ACPPermissionDecision indicating whether the operation is allowed
         """
+        decision, _ = await self.execute_callback(callback)
+        return decision
+
+    async def execute_callback(
+        self, callback: ACPFilesystemCallback
+    ) -> tuple[ACPPermissionDecision, dict[str, Any] | None]:
+        """Execute a filesystem callback and return both decision and ACP payload."""
         operation = callback.operation
         path = callback.path
 
         try:
             if operation == "read":
-                return await self._handle_read(callback)
-            elif operation == "write":
-                return await self._handle_write(callback)
-            else:
-                return ACPPermissionDecision(
+                return await self._execute_read(callback)
+            if operation == "write":
+                return await self._execute_write(callback)
+            return (
+                ACPPermissionDecision(
                     request_id=callback.metadata.get("request_id", ""),
                     granted=False,
                     reason=f"Unsupported filesystem operation: {operation}",
-                )
+                ),
+                None,
+            )
         except PermissionError as e:
-            return ACPPermissionDecision(
-                request_id=callback.metadata.get("request_id", ""),
-                granted=False,
-                reason=str(e),
+            return (
+                ACPPermissionDecision(
+                    request_id=callback.metadata.get("request_id", ""),
+                    granted=False,
+                    reason=str(e),
+                ),
+                None,
             )
         except FileNotFoundError:
-            return ACPPermissionDecision(
-                request_id=callback.metadata.get("request_id", ""),
-                granted=False,
-                reason=f"File not found: {path}",
+            return (
+                ACPPermissionDecision(
+                    request_id=callback.metadata.get("request_id", ""),
+                    granted=False,
+                    reason=f"File not found: {path}",
+                ),
+                None,
             )
         except IsADirectoryError:
-            return ACPPermissionDecision(
-                request_id=callback.metadata.get("request_id", ""),
-                granted=False,
-                reason=f"Cannot read directory: {path} is a directory, not a file",
+            return (
+                ACPPermissionDecision(
+                    request_id=callback.metadata.get("request_id", ""),
+                    granted=False,
+                    reason=f"Cannot read directory: {path} is a directory, not a file",
+                ),
+                None,
             )
         except Exception as e:
-            return ACPPermissionDecision(
-                request_id=callback.metadata.get("request_id", ""),
-                granted=False,
-                reason=f"Error: {str(e)}",
+            return (
+                ACPPermissionDecision(
+                    request_id=callback.metadata.get("request_id", ""),
+                    granted=False,
+                    reason=f"Error: {str(e)}",
+                ),
+                None,
             )
 
-    async def _handle_read(self, callback: ACPFilesystemCallback) -> ACPPermissionDecision:
+    async def handle_filesystem(self, callback: ACPFilesystemCallback) -> ACPPermissionDecision:
+        """Compatibility wrapper for callback-registry and contract callers."""
+        return await self.handle_filesystem_callback(callback)
+
+    async def _execute_read(
+        self, callback: ACPFilesystemCallback
+    ) -> tuple[ACPPermissionDecision, dict[str, Any]]:
         """Handle a read text file operation.
 
         Args:
@@ -162,13 +189,16 @@ class ACPFilesystemHandler:
         # Check file size
         size = file_path.stat().st_size
         if size > self._MAX_CHARS * 4:
-            return ACPPermissionDecision(
-                request_id=metadata.get("request_id", ""),
-                granted=False,
-                reason=(
-                    f"File too large ({size:,} bytes). "
-                    "Use exec tool with head/tail/grep to read portions."
+            return (
+                ACPPermissionDecision(
+                    request_id=metadata.get("request_id", ""),
+                    granted=False,
+                    reason=(
+                        f"File too large ({size:,} bytes). "
+                        "Use exec tool with head/tail/grep to read portions."
+                    ),
                 ),
+                {},
             )
 
         # Read the content
@@ -180,7 +210,7 @@ class ACPFilesystemHandler:
 
         if line is not None or limit is not None:
             lines = content.splitlines()
-            start_line = line if line is not None else 0
+            start_line = self._normalize_start_line(line, metadata)
             limit_count = limit if limit is not None else len(lines)
             selected_lines = lines[start_line : start_line + limit_count]
             content = "\n".join(selected_lines)
@@ -191,13 +221,18 @@ class ACPFilesystemHandler:
                 content[: self._MAX_CHARS] + f"\n\n... (truncated, {len(content):,} chars total)"
             )
 
-        return ACPPermissionDecision(
-            request_id=metadata.get("request_id", ""),
-            granted=True,
-            reason=f"Successfully read {len(content)} characters from {path}:\n\n{content}",
+        return (
+            ACPPermissionDecision(
+                request_id=metadata.get("request_id", ""),
+                granted=True,
+                reason=f"Successfully read {len(content)} characters from {path}:\n\n{content}",
+            ),
+            {"content": content},
         )
 
-    async def _handle_write(self, callback: ACPFilesystemCallback) -> ACPPermissionDecision:
+    async def _execute_write(
+        self, callback: ACPFilesystemCallback
+    ) -> tuple[ACPPermissionDecision, dict[str, Any]]:
         """Handle a write text file operation.
 
         Args:
@@ -211,10 +246,13 @@ class ACPFilesystemHandler:
         metadata = callback.metadata
 
         if content is None:
-            return ACPPermissionDecision(
-                request_id=metadata.get("request_id", ""),
-                granted=False,
-                reason="Write operation requires content parameter",
+            return (
+                ACPPermissionDecision(
+                    request_id=metadata.get("request_id", ""),
+                    granted=False,
+                    reason="Write operation requires content parameter",
+                ),
+                {},
             )
 
         # Resolve the path with workspace safety checks
@@ -226,11 +264,22 @@ class ACPFilesystemHandler:
         # Write the content
         file_path.write_text(content, encoding="utf-8")
 
-        return ACPPermissionDecision(
-            request_id=metadata.get("request_id", ""),
-            granted=True,
-            reason=f"Successfully wrote {len(content)} bytes to {path}",
+        return (
+            ACPPermissionDecision(
+                request_id=metadata.get("request_id", ""),
+                granted=True,
+                reason=f"Successfully wrote {len(content)} bytes to {path}",
+            ),
+            {},
         )
+
+    @staticmethod
+    def _normalize_start_line(line: Any, metadata: dict[str, Any]) -> int:
+        if not isinstance(line, int):
+            return 0
+        if metadata.get("session_id"):
+            return max(line - 1, 0)
+        return max(line, 0)
 
 
 # Type alias for the callback handler

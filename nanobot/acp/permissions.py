@@ -21,11 +21,18 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Awaitable, Callable, Optional, cast
 
 from nanobot.acp.interfaces import ACPCallbackRegistry
-from nanobot.acp.policy import UnattendedPermissionPolicy
-from nanobot.acp.types import ACPPermissionDecision, ACPPermissionRequest
+from nanobot.acp.policy import PermissionMode, UnattendedPermissionPolicy
+from nanobot.acp.types import (
+    ACPFilesystemCallback,
+    ACPPermissionDecision,
+    ACPPermissionRequest,
+    ACPTerminalCallback,
+)
+
+RUNTIME_PERMISSION_POLICIES = {"allow", "deny", "ask", "auto"}
 
 
 @dataclass
@@ -68,7 +75,7 @@ class ACPPermissionBroker:
         """
         self._callback_registry = callback_registry
         self._interactive = interactive
-        self._policy = policy or UnattendedPermissionPolicy(default_mode="deny")
+        self._policy = policy
         self._timeout = timeout
 
         # Track in-flight requests for correlation
@@ -82,7 +89,11 @@ class ACPPermissionBroker:
     @property
     def policy(self) -> UnattendedPermissionPolicy:
         """Get the current permission policy."""
-        return self._policy
+        if self._policy is not None:
+            return self._policy
+        if self._interactive:
+            return UnattendedPermissionPolicy(default_mode="ask")
+        return UnattendedPermissionPolicy(default_mode="deny")
 
     def set_policy(self, policy: UnattendedPermissionPolicy) -> None:
         """Set a new permission policy.
@@ -133,6 +144,21 @@ class ACPPermissionBroker:
         Returns:
             The permission decision.
         """
+        mode = self._resolve_mode(request)
+        action = self._get_action_key(request)
+
+        if mode == "allow":
+            return self._create_approval(
+                request,
+                f"Allowed by trusted interactive policy (action: {action})",
+            )
+
+        if mode == "deny":
+            return self._create_denial(
+                request,
+                f"Denied by trusted interactive policy (action: {action})",
+            )
+
         if self._callback_registry is None:
             return self._create_denial(
                 request, "No callback registry configured for interactive mode"
@@ -165,11 +191,8 @@ class ACPPermissionBroker:
         Returns:
             The permission decision based on policy.
         """
-        # Determine the action key for policy resolution
         action = self._get_action_key(request)
-
-        # Resolve the permission mode from policy
-        mode = self._policy.resolve(action)
+        mode = self._resolve_mode(request)
 
         if mode == "allow":
             return self._create_approval(request, f"Allowed by policy (action: {action})")
@@ -244,6 +267,11 @@ class ACPPermissionBroker:
 
         return permission_type
 
+    def _resolve_mode(self, request: ACPPermissionRequest) -> PermissionMode:
+        """Resolve the effective permission mode for the current request."""
+        action = self._get_action_key(request)
+        return self.policy.resolve(action)
+
     def _create_approval(
         self, request: ACPPermissionRequest, reason: Optional[str] = None
     ) -> ACPPermissionDecision:
@@ -307,13 +335,151 @@ class ACPPermissionBroker:
         return len(self._pending_requests)
 
 
+class ACPCallbackRouter:
+    """Concrete callback registry for ACP permission routing.
+
+    This keeps the live service path on the same callback contract used by the
+    tests so interactive `ask` policy sessions can route permission requests
+    through registered handlers once those handlers are wired.
+    """
+
+    def __init__(self):
+        self._filesystem_handler: Optional[
+            Callable[[ACPFilesystemCallback], Awaitable[ACPPermissionDecision]]
+        ] = None
+        self._terminal_handler: Optional[
+            Callable[[ACPTerminalCallback], Awaitable[ACPPermissionDecision]]
+        ] = None
+        self._webfetch_handler: Optional[
+            Callable[[dict[str, object]], Awaitable[ACPPermissionDecision]]
+        ] = None
+
+    def register_filesystem_callback(
+        self, handler: Callable[[ACPFilesystemCallback], Awaitable[ACPPermissionDecision]]
+    ) -> None:
+        self._filesystem_handler = handler
+
+    def register_terminal_callback(
+        self, handler: Callable[[ACPTerminalCallback], Awaitable[ACPPermissionDecision]]
+    ) -> None:
+        self._terminal_handler = handler
+
+    def register_webfetch_callback(
+        self, handler: Callable[[dict[str, object]], Awaitable[ACPPermissionDecision]]
+    ) -> None:
+        self._webfetch_handler = handler
+
+    async def handle_permission_request(
+        self, request: ACPPermissionRequest
+    ) -> ACPPermissionDecision:
+        if request.permission_type == "filesystem" and self._filesystem_handler is not None:
+            return await self._filesystem_handler(request.callback)
+
+        if request.permission_type == "terminal" and self._terminal_handler is not None:
+            return await self._terminal_handler(request.callback)
+
+        if request.permission_type == "webfetch" and self._webfetch_handler is not None:
+            return await self._webfetch_handler(request.callback)
+
+        return ACPPermissionDecision(
+            request_id=request.id,
+            granted=False,
+            reason="No handler registered for permission type",
+        )
+
+
 class PermissionBrokerFactory:
     """Factory for creating permission brokers with common configurations."""
 
+    _TRUSTED_INTERACTIVE_SESSION_PREFIXES = ("telegram:",)
+    _UNATTENDED_SESSION_PREFIXES = ("cron:",)
+    _UNATTENDED_SESSION_KEYS = {"heartbeat"}
+
+    @classmethod
+    def is_trusted_interactive_session(cls, session_key: str) -> bool:
+        """Return True only for trusted Telegram chat sessions.
+
+        `interactive=True` is reserved for the current trusted Telegram control
+        plane. Cron, heartbeat, and other non-Telegram surfaces stay on
+        `interactive=False` so `policy="auto"` cannot silently widen approval-
+        free execution beyond the intended channel.
+        """
+        return session_key.startswith(cls._TRUSTED_INTERACTIVE_SESSION_PREFIXES)
+
+    @classmethod
+    def create_for_session(
+        cls,
+        session_key: str,
+        *,
+        agent_policy: str = "auto",
+        permission_policies: Optional[dict[str, str]] = None,
+        callback_registry: Optional[ACPCallbackRegistry] = None,
+        timeout: Optional[float] = None,
+    ) -> ACPPermissionBroker:
+        """Create a broker for a specific nanobot session key.
+
+        Trusted interactive chat sessions resolve `policy="auto"` to allow by
+        default without prompting. Cron and other unattended sessions keep
+        `interactive=False` and use unattended policy defaults instead.
+        """
+        interactive = cls.is_trusted_interactive_session(session_key)
+        policy = cls._build_session_policy(
+            interactive=interactive,
+            agent_policy=agent_policy,
+            permission_policies=permission_policies,
+        )
+        return cls.create_from_config(
+            interactive=interactive,
+            callback_registry=callback_registry,
+            policy=policy,
+            timeout=timeout,
+        )
+
+    @classmethod
+    def _build_session_policy(
+        cls,
+        *,
+        interactive: bool,
+        agent_policy: str,
+        permission_policies: Optional[dict[str, str]] = None,
+    ) -> UnattendedPermissionPolicy:
+        default_mode = cls._resolve_runtime_mode(agent_policy, interactive=interactive)
+        overrides: dict[str, PermissionMode] = {}
+
+        for action, configured_mode in (permission_policies or {}).items():
+            resolved_mode = cls._resolve_runtime_mode(
+                configured_mode,
+                interactive=interactive,
+                fallback=default_mode,
+            )
+            if action in {"default", "*"}:
+                default_mode = resolved_mode
+                continue
+            overrides[action] = resolved_mode
+
+        return UnattendedPermissionPolicy(
+            default_mode=default_mode,
+            action_overrides=overrides,
+        )
+
+    @staticmethod
+    def _resolve_runtime_mode(
+        configured_mode: str,
+        *,
+        interactive: bool,
+        fallback: PermissionMode = "deny",
+    ) -> PermissionMode:
+        if configured_mode not in RUNTIME_PERMISSION_POLICIES:
+            return fallback
+        if configured_mode == "auto":
+            return cast(PermissionMode, "allow" if interactive else "deny")
+        return cast(PermissionMode, configured_mode)
+
     @staticmethod
     def create_interactive(
-        callback_registry: ACPCallbackRegistry,
+        callback_registry: Optional[ACPCallbackRegistry] = None,
         timeout: float = 30.0,
+        policy: Optional[UnattendedPermissionPolicy] = None,
     ) -> ACPPermissionBroker:
         """Create an interactive permission broker.
 
@@ -327,6 +493,7 @@ class PermissionBrokerFactory:
         return ACPPermissionBroker(
             callback_registry=callback_registry,
             interactive=True,
+            policy=policy,
             timeout=timeout,
         )
 

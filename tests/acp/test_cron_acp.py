@@ -17,6 +17,7 @@ RED PHASE: These tests capture the gaps where:
 import asyncio
 from datetime import datetime, timezone
 from inspect import iscoroutinefunction
+from unittest.mock import patch
 
 import pytest
 
@@ -360,6 +361,53 @@ async def test_unattended_permission_deny_policy(tmp_path) -> None:
 
     decision = await broker.request_permission(request)
     assert decision.granted is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "expected_granted"),
+    [("allow", True), ("deny", False)],
+)
+async def test_unattended_session_policy_boundary_stays_explicit(mode, expected_granted) -> None:
+    """Cron/unattended sessions keep interactive=False and obey their configured policy."""
+    import nanobot.cli.commands as commands_module
+    from nanobot.acp.types import ACPPermissionRequest
+    from nanobot.config.schema import ACPAgentDefinition, Config
+
+    config = Config()
+    config.acp.agents["opencode"] = ACPAgentDefinition(
+        id="opencode",
+        command="opencode",
+        args=["acp"],
+        policy="auto",
+    )
+    config.acp.default_agent = "opencode"
+    config.acp.permission_policies = {"default": mode}
+
+    commands_module._acp_service = None
+    try:
+        service = commands_module._get_acp_service(config)
+        assert service is not None
+
+        with patch("nanobot.acp.service.SDKClient") as mock_client_cls:
+            service._create_client("cron:test-job")
+
+        permission_broker = mock_client_cls.call_args.kwargs["permission_broker"]
+        assert permission_broker is not None
+        assert permission_broker.is_interactive is False
+
+        decision = await permission_broker.request_permission(
+            ACPPermissionRequest(
+                id=f"perm-cron-{mode}",
+                permission_type="terminal",
+                description="Run scheduled command",
+                resource="/bin/ls",
+            )
+        )
+
+        assert decision.granted is expected_granted
+    finally:
+        commands_module._acp_service = None
 
 
 # ========== Test: Delivery back to channels ==========

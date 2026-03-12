@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from nanobot.acp.interfaces import ACPCallbackRegistry, ACPSessionStore, ACPUpdateSink
 from nanobot.acp.sdk_client import SDKClient, SDKError
@@ -25,6 +25,7 @@ class ACPServiceConfig:
     workspace_dir: Optional[Path] = None
     callback_registry: Optional[ACPCallbackRegistry] = None
     agent_definition: Optional[Any] = None  # ACPAgentDefinition from config.schema
+    permission_broker_factory: Optional[Callable[[str], Any]] = None
 
 
 class ACPService:
@@ -46,6 +47,8 @@ class ACPService:
         self._clients: dict[str, SDKClient] = {}
         # Cache capabilities from initialize responses
         self._capabilities: dict[str, Any] = {}
+        self._filesystem_handler: Any = None
+        self._terminal_manager: Any = None
 
         # Initialize stores if storage dir is provided
         if self._config.storage_dir:
@@ -54,7 +57,7 @@ class ACPService:
             self._session_store = ACPFileSessionStore(self._config.storage_dir / "sessions")
             self._binding_store = ACPSessionBindingStore(self._config.storage_dir / "bindings")
 
-    def _create_client(self) -> SDKClient:
+    def _create_client(self, nanobot_session_key: str | None = None) -> SDKClient:
         """Create an SDK client with proper configuration.
 
         Returns:
@@ -69,6 +72,10 @@ class ACPService:
         if cwd is None and self._config.workspace_dir is not None:
             cwd = str(self._config.workspace_dir)
 
+        permission_broker = None
+        if nanobot_session_key is not None and self._config.permission_broker_factory is not None:
+            permission_broker = self._config.permission_broker_factory(nanobot_session_key)
+
         return SDKClient(
             agent_path=self._config.agent_path,
             model=model,
@@ -77,6 +84,9 @@ class ACPService:
             cwd=cwd,
             session_store=self._session_store,
             callback_registry=self._config.callback_registry,
+            permission_broker=permission_broker,
+            filesystem_handler=self._filesystem_handler,
+            terminal_manager=self._terminal_manager,
         )
 
     async def _apply_session_overrides(self, client: SDKClient, session_id: str) -> None:
@@ -99,7 +109,7 @@ class ACPService:
             Dict containing session information.
         """
         # Create a new client for this session with full agent definition
-        client = self._create_client()
+        client = self._create_client(nanobot_session_key)
 
         # Initialize and create session
         await client.initialize()
@@ -145,6 +155,25 @@ class ACPService:
         Returns:
             Dict containing session information.
         """
+        active_client = self._clients.get(nanobot_session_key)
+        if active_client is not None and active_client.current_session_id:
+            binding = None
+            if self._binding_store:
+                binding = self._binding_store.load_binding(nanobot_session_key)
+
+            agent_id = (
+                binding.acp_agent_id
+                if binding is not None
+                else getattr(self._config.agent_definition, "id", None) or "default"
+            )
+            return {
+                "nanobot_session_key": nanobot_session_key,
+                "acp_session_id": active_client.current_session_id,
+                "agent_id": agent_id,
+                "status": "loaded",
+                "session": None,
+            }
+
         # Check for existing binding
         binding = None
         if self._binding_store:
@@ -155,7 +184,7 @@ class ACPService:
             return await self.create_session(nanobot_session_key)
 
         # Create client and initialize
-        client = self._create_client()
+        client = self._create_client(nanobot_session_key)
         await client.initialize()
 
         # Cache capabilities
@@ -224,12 +253,14 @@ class ACPService:
         self,
         nanobot_session_key: str,
         message: str,
+        on_chunk: Callable[[str], Awaitable[None]] | None = None,
     ) -> list[ACPStreamChunk]:
         """Process an incoming chat message through ACP.
 
         Args:
             nanobot_session_key: The nanobot session key.
             message: The message content.
+            on_chunk: Optional callback invoked for each live text chunk.
 
         Returns:
             List of response stream chunks.
@@ -239,7 +270,7 @@ class ACPService:
             await self.load_session(nanobot_session_key)
 
         client = self._clients[nanobot_session_key]
-        return await client.prompt(message)
+        return await client.prompt(message, on_chunk=on_chunk)
 
     async def cancel_operation(self, nanobot_session_key: str) -> None:
         """Cancel an ongoing operation for a session.
@@ -264,14 +295,32 @@ class ACPService:
         if nanobot_session_key in self._clients:
             self._clients[nanobot_session_key].subscribe_updates(sink)
 
+    def clear_update_subscription(self, nanobot_session_key: str) -> None:
+        """Clear the active update sink for a session, if one exists."""
+        if nanobot_session_key in self._clients:
+            self._clients[nanobot_session_key].clear_update_subscription()
+
     def register_filesystem_callback(self, handler: Any) -> None:
         """Register a filesystem permission handler for all sessions.
 
         Args:
             handler: Async handler for filesystem callbacks.
         """
+        register_callback = True
+        if hasattr(handler, "handle_filesystem_callback"):
+            self._filesystem_handler = handler
+            register_callback = False
+        elif self._filesystem_handler is None:
+            self._filesystem_handler = handler
+
+        if register_callback and self._config.callback_registry is not None:
+            self._config.callback_registry.register_filesystem_callback(handler)
+
+        client_handler = (
+            self._filesystem_handler if self._filesystem_handler is not None else handler
+        )
         for client in self._clients.values():
-            client.register_filesystem_callback(handler)
+            client.register_filesystem_callback(client_handler)
 
     def register_terminal_callback(self, handler: Any) -> None:
         """Register a terminal permission handler for all sessions.
@@ -279,8 +328,19 @@ class ACPService:
         Args:
             handler: Async handler for terminal callbacks.
         """
+        register_callback = True
+        if hasattr(handler, "create"):
+            self._terminal_manager = handler
+            register_callback = False
+        elif self._terminal_manager is None:
+            self._terminal_manager = handler
+
+        if register_callback and self._config.callback_registry is not None:
+            self._config.callback_registry.register_terminal_callback(handler)
+
+        client_handler = self._terminal_manager if self._terminal_manager is not None else handler
         for client in self._clients.values():
-            client.register_terminal_callback(handler)
+            client.register_terminal_callback(client_handler)
 
     async def shutdown_session(self, nanobot_session_key: str) -> None:
         """Shutdown a specific session.
@@ -291,6 +351,20 @@ class ACPService:
         if nanobot_session_key in self._clients:
             await self._clients[nanobot_session_key].shutdown()
             del self._clients[nanobot_session_key]
+
+    async def reset_session(self, nanobot_session_key: str) -> None:
+        """Drop both live client state and any persisted ACP binding."""
+        shutdown_error: Exception | None = None
+        try:
+            await self.shutdown_session(nanobot_session_key)
+        except Exception as exc:  # pragma: no cover - defensive transport cleanup path
+            shutdown_error = exc
+
+        if self._binding_store is not None:
+            self._binding_store.delete_binding(nanobot_session_key)
+
+        if shutdown_error is not None:
+            raise shutdown_error
 
     async def shutdown(self) -> None:
         """Shutdown all sessions and cleanup resources."""

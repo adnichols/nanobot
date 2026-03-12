@@ -38,7 +38,10 @@ def _get_acp_service(config: Config):
 
     # Import here to avoid errors if acp module is not available
     try:
+        from nanobot.acp.fs import create_filesystem_handler
+        from nanobot.acp.permissions import ACPCallbackRouter, PermissionBrokerFactory
         from nanobot.acp.service import ACPService, ACPServiceConfig
+        from nanobot.acp.terminal import ACPTerminalManager
 
         storage_dir = config.workspace_path / ".nanobot" / "acp"
 
@@ -47,13 +50,36 @@ def _get_acp_service(config: Config):
         if config.acp.default_agent in config.acp.agents:
             agent_def = config.acp.agents.get(config.acp.default_agent)
 
+        callback_registry = ACPCallbackRouter()
+        broker_factory = None
+        if agent_def is not None:
+
+            def build_permission_broker(session_key: str):
+                return PermissionBrokerFactory.create_for_session(
+                    session_key,
+                    agent_policy=agent_def.policy,
+                    permission_policies=config.acp.permission_policies,
+                    callback_registry=callback_registry,
+                )
+
+            broker_factory = build_permission_broker
+
         acp_config = ACPServiceConfig(
             storage_dir=storage_dir,
             workspace_dir=config.workspace_path,
             agent_path=agent_def.command if agent_def else None,
+            callback_registry=callback_registry,
             agent_definition=agent_def,
+            permission_broker_factory=broker_factory,
         )
         _acp_service = ACPService(acp_config)
+        filesystem_handler = create_filesystem_handler(
+            workspace=config.workspace_path,
+            restrict_to_workspace=config.tools.restrict_to_workspace,
+        )
+        terminal_manager = ACPTerminalManager(callback_registry=callback_registry)
+        _acp_service.register_filesystem_callback(filesystem_handler)
+        _acp_service.register_terminal_callback(terminal_manager)
         return _acp_service
     except ImportError as exc:
         print(f"Warning: ACP unavailable, falling back to local agent: {exc}")
@@ -340,6 +366,7 @@ def gateway(
         channels_config=config.channels,
         acp_service=acp_service,
         acp_default_agent=config.acp.default_agent,
+        acp_allow_local_fallback=config.acp.allow_local_fallback,
     )
 
     # Set cron callback (needs agent)
@@ -535,6 +562,7 @@ def agent(
         channels_config=config.channels,
         acp_service=acp_service,
         acp_default_agent=config.acp.default_agent,
+        acp_allow_local_fallback=config.acp.allow_local_fallback,
     )
 
     # Show spinner when logs are off (no output to miss); skip when logs are on
@@ -546,11 +574,17 @@ def agent(
         # Animated spinner is safe to use with prompt_toolkit input handling
         return console.status("[dim]nanobot is thinking...[/dim]", spinner="dots")
 
-    async def _cli_progress(content: str, *, tool_hint: bool = False) -> None:
+    async def _cli_progress(
+        content: str,
+        *,
+        tool_hint: bool = False,
+        progress_kind: str = "content",
+    ) -> None:
         ch = agent_loop.channels_config
-        if ch and tool_hint and not ch.send_tool_hints:
-            return
-        if ch and not tool_hint and not ch.send_progress:
+        if ch and not ch.allows_progress(
+            tool_hint=tool_hint,
+            progress_kind="tool_hint" if tool_hint else progress_kind,
+        ):
             return
         console.print(f"  [dim]↳ {content}[/dim]")
 
@@ -597,11 +631,16 @@ def agent(
                     try:
                         msg = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
                         if msg.metadata.get("_progress"):
-                            is_tool_hint = msg.metadata.get("_tool_hint", False)
+                            is_tool_hint = bool(msg.metadata.get("_tool_hint", False))
+                            progress_kind = msg.metadata.get(
+                                "_progress_kind",
+                                "tool_hint" if is_tool_hint else "content",
+                            )
                             ch = agent_loop.channels_config
-                            if ch and is_tool_hint and not ch.send_tool_hints:
-                                pass
-                            elif ch and not is_tool_hint and not ch.send_progress:
+                            if ch and not ch.allows_progress(
+                                tool_hint=is_tool_hint,
+                                progress_kind=progress_kind,
+                            ):
                                 pass
                             else:
                                 console.print(f"  [dim]↳ {msg.content}[/dim]")

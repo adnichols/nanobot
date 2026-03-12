@@ -7,7 +7,13 @@ validated, and separate from MCP config.
 import pytest
 from pydantic import ValidationError
 
-from nanobot.config.schema import ACPAgentDefinition, ACPConfig, ACPProcessSettings, Config
+from nanobot.config.schema import (
+    ACPAgentDefinition,
+    ACPConfig,
+    ACPProcessSettings,
+    ChannelsConfig,
+    Config,
+)
 
 
 class TestACPAgentDefinition:
@@ -83,6 +89,7 @@ class TestACPConfig:
         config = ACPConfig(agents={})
         assert config.agents == {}
         assert config.default_agent is None
+        assert config.allow_local_fallback is False
         assert config.permission_policies == {}
         assert config.process_settings is not None
 
@@ -106,6 +113,11 @@ class TestACPConfig:
             default_agent="opencode",
         )
         assert config.default_agent == "opencode"
+
+    def test_acp_config_allow_local_fallback_override(self):
+        """Test ACP fallback policy override."""
+        config = ACPConfig(allow_local_fallback=True)
+        assert config.allow_local_fallback is True
 
     def test_acp_config_permission_policies(self):
         """Test permission policy defaults."""
@@ -146,6 +158,55 @@ class TestConfigIntegration:
         config = Config()
         assert config.acp.agents == {}
         assert config.acp.default_agent is None
+        assert config.acp.allow_local_fallback is False
+
+    def test_channels_progress_visibility_defaults(self):
+        """Test that ACP progress visibility flags default to hidden."""
+        channels = Config().channels
+        assert channels.send_progress is True
+        assert channels.send_tool_hints is False
+        assert channels.acp_stream_content is False
+        assert channels.acp_show_thinking is False
+        assert channels.acp_show_tool_calls is False
+        assert channels.acp_show_tool_results is False
+        assert channels.acp_show_system is False
+
+    def test_channels_allows_progress_respects_visibility_flags(self):
+        """Test channel progress filtering across ACP-specific visibility kinds."""
+        channels = ChannelsConfig(
+            send_progress=True,
+            send_tool_hints=False,
+            acp_show_thinking=True,
+            acp_show_tool_calls=False,
+            acp_show_tool_results=True,
+            acp_show_system=False,
+        )
+
+        assert channels.allows_progress(progress_kind="content") is True
+        assert channels.allows_progress(progress_kind="thinking") is True
+        assert channels.allows_progress(progress_kind="tool_call") is False
+        assert channels.allows_progress(progress_kind="tool_result") is True
+        assert channels.allows_progress(progress_kind="system") is False
+        assert channels.allows_progress(tool_hint=True, progress_kind="tool_hint") is False
+
+    def test_channels_allows_progress_short_circuits_when_progress_disabled(self):
+        """Test disabling send_progress suppresses every non-tool-hint update."""
+        channels = ChannelsConfig(
+            send_progress=False,
+            send_tool_hints=True,
+            acp_show_thinking=True,
+            acp_show_tool_calls=True,
+            acp_show_tool_results=True,
+            acp_show_system=True,
+        )
+
+        assert channels.allows_progress(progress_kind="content") is False
+        assert channels.allows_progress(progress_kind="thinking") is False
+        assert channels.allows_progress(progress_kind="tool_call") is False
+        assert channels.allows_progress(progress_kind="tool_result") is False
+        assert channels.allows_progress(progress_kind="system") is False
+        assert channels.allows_progress(tool_hint=True, progress_kind="tool_hint") is True
+
 
     def test_config_acp_with_agents(self):
         """Test Config loads with ACP agents."""

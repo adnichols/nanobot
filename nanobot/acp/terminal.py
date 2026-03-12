@@ -16,6 +16,7 @@ Key design decisions:
 from __future__ import annotations
 
 import asyncio
+import os
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -42,15 +43,43 @@ class ACPTerminal:
     command: list[str]
     working_directory: Optional[str] = None
     environment: dict[str, str] = field(default_factory=dict)
+    output_byte_limit: Optional[int] = None
+    output_truncated: bool = False
     state: ACPTerminalState = ACPTerminalState.CREATED
     exit_code: Optional[int] = None
     _process: Optional[asyncio.subprocess.Process] = field(default=None, repr=False)
     _output_buffer: list[str] = field(default_factory=list, repr=False)
+    _reader_tasks: list[asyncio.Task[None]] = field(default_factory=list, repr=False)
 
     @property
     def output(self) -> str:
         """Get the combined output from stdout and stderr."""
         return "".join(self._output_buffer)
+
+    def append_output(self, text: str) -> None:
+        """Append output while respecting the configured byte limit."""
+        if not text:
+            return
+
+        self._output_buffer.append(text)
+        if self.output_byte_limit is None:
+            return
+
+        encoded = self.output.encode("utf-8", errors="replace")
+        if len(encoded) <= self.output_byte_limit:
+            return
+
+        self.output_truncated = True
+        trimmed = encoded[-self.output_byte_limit :]
+        while trimmed:
+            try:
+                retained = trimmed.decode("utf-8")
+                break
+            except UnicodeDecodeError:
+                trimmed = trimmed[1:]
+        else:
+            retained = ""
+        self._output_buffer = [retained]
 
 
 class ACPInvalidTerminalError(Exception):
@@ -94,12 +123,10 @@ class ACPTerminalManager:
         ] = None
         self._internal_handler: bool = True  # Track if we use internal handler
 
-        # Register with callback registry if provided
-        # Only register our internal handler if no handler is already registered
+        # A callback registry represents an external approval surface. Do not
+        # inject the internal allow-all handler there, or `policy="ask"`
+        # silently becomes approval-free in trusted Telegram sessions.
         if callback_registry is not None:
-            existing_handler = getattr(callback_registry, "_terminal_handler", None)
-            if existing_handler is None:
-                callback_registry.register_terminal_callback(self._handle_permission)
             self._internal_handler = False
 
     async def _handle_permission(self, callback: ACPTerminalCallback) -> ACPPermissionDecision:
@@ -111,6 +138,16 @@ class ACPTerminalManager:
             granted=True,
             reason="Allowed by default",
         )
+
+    async def handle_permission_request(
+        self, callback: ACPTerminalCallback
+    ) -> ACPPermissionDecision:
+        """Default permission surface exposed to callback registries."""
+        return await self._handle_permission(callback)
+
+    async def handle_terminal(self, callback: ACPTerminalCallback) -> ACPPermissionDecision:
+        """Compatibility wrapper for contract-style terminal permission checks."""
+        return await self.handle_permission_request(callback)
 
     def _get_terminal_handler(
         self,
@@ -134,6 +171,9 @@ class ACPTerminalManager:
         command: list[str],
         working_directory: Optional[str] = None,
         environment: Optional[dict[str, str]] = None,
+        output_byte_limit: Optional[int] = None,
+        *,
+        permission_checked: bool = False,
     ) -> str:
         """Create a new terminal with the given command.
 
@@ -141,6 +181,7 @@ class ACPTerminalManager:
             command: Command and arguments to execute.
             working_directory: Optional working directory.
             environment: Optional environment variables.
+            output_byte_limit: Optional output retention limit.
 
         Returns:
             Terminal ID for the created terminal.
@@ -152,9 +193,10 @@ class ACPTerminalManager:
         if not command:
             raise ValueError("Command cannot be empty")
 
-        # Request permission if handler is registered
+        # Request permission if handler is registered and the caller has not
+        # already applied policy gating through the shared permission broker.
         handler = self._get_terminal_handler()
-        if handler is not None:
+        if handler is not None and not permission_checked:
             callback = ACPTerminalCallback(
                 command=" ".join(command),
                 working_directory=working_directory,
@@ -173,6 +215,7 @@ class ACPTerminalManager:
             command=command,
             working_directory=working_directory,
             environment=environment or {},
+            output_byte_limit=output_byte_limit,
             state=ACPTerminalState.CREATED,
         )
 
@@ -197,20 +240,27 @@ class ACPTerminalManager:
             raise ACPInvalidTerminalError(terminal_id, "Terminal not found")
 
         try:
+            env = None
+            if terminal.environment:
+                env = {**os.environ, **terminal.environment}
+
             # Create subprocess with pipes for stdout/stderr
             process = await asyncio.create_subprocess_exec(
                 *terminal.command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=terminal.working_directory,
-                env=terminal.environment,
+                env=env,
             )
 
             terminal._process = process
             terminal.state = ACPTerminalState.RUNNING
 
-            # Start background task to read output
-            asyncio.create_task(self._read_output(terminal_id))
+            # Start background tasks to read stdout and stderr incrementally.
+            terminal._reader_tasks = [
+                asyncio.create_task(self._consume_stream(terminal_id, process.stdout)),
+                asyncio.create_task(self._consume_stream(terminal_id, process.stderr)),
+            ]
 
         except FileNotFoundError:
             # Command not found - mark as completed with error
@@ -224,34 +274,39 @@ class ACPTerminalManager:
             terminal.exit_code = 1
             # Don't raise here - let the caller use wait_for_exit to get the exit code
 
-    async def _read_output(self, terminal_id: str) -> None:
-        """Read output from the terminal process in the background.
+    async def _consume_stream(
+        self,
+        terminal_id: str,
+        stream: asyncio.StreamReader | None,
+    ) -> None:
+        """Consume one process stream incrementally in the background.
 
         Args:
             terminal_id: ID of the terminal to read from.
+            stream: The stream reader to consume.
         """
         terminal = self._terminals.get(terminal_id)
-        if terminal is None or terminal._process is None:
+        if terminal is None or stream is None:
             return
 
-        process = terminal._process
-
         try:
-            # Read stdout
-            if process.stdout:
-                stdout_data = await process.stdout.read()
-                if stdout_data:
-                    terminal._output_buffer.append(stdout_data.decode("utf-8", errors="replace"))
-
-            # Read stderr
-            if process.stderr:
-                stderr_data = await process.stderr.read()
-                if stderr_data:
-                    terminal._output_buffer.append(stderr_data.decode("utf-8", errors="replace"))
-
+            while True:
+                chunk = await stream.read(4096)
+                if not chunk:
+                    break
+                terminal.append_output(chunk.decode("utf-8", errors="replace"))
+        except asyncio.CancelledError:
+            raise
         except Exception:
             # Ignore read errors - they'll be handled in wait_for_exit
             pass
+
+    async def _await_output_readers(self, terminal: ACPTerminal) -> None:
+        if not terminal._reader_tasks:
+            return
+        tasks = list(terminal._reader_tasks)
+        terminal._reader_tasks.clear()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def output(self, terminal_id: str) -> str:
         """Get output from a terminal.
@@ -274,7 +329,7 @@ class ACPTerminalManager:
 
         # Read any remaining output
         if terminal._process and terminal._process.returncode is not None:
-            await self._read_output(terminal_id)
+            await self._await_output_readers(terminal)
 
         return "".join(terminal._output_buffer)
 
@@ -315,7 +370,7 @@ class ACPTerminalManager:
             terminal.exit_code = exit_code
 
             # Read any remaining output
-            await self._read_output(terminal_id)
+            await self._await_output_readers(terminal)
 
             # Update state based on how process exited
             if terminal.state != ACPTerminalState.KILLED:
@@ -389,6 +444,9 @@ class ACPTerminalManager:
                 pass
 
         # Clear resources
+        for task in terminal._reader_tasks:
+            task.cancel()
+        terminal._reader_tasks.clear()
         terminal._process = None
         terminal._output_buffer.clear()
         terminal.state = ACPTerminalState.RELEASED
