@@ -2,7 +2,7 @@
 
 ## Status
 
-- ready
+- complete
 
 ## Goal
 
@@ -89,7 +89,8 @@
 
 - Read this plan fully before editing code.
 - Confirm the owned file set before starting and do not drift outside it unless a logged deviation becomes necessary.
-- Start with the first unchecked item in `## Progress`.
+- This plan is complete; there is no unchecked progress item to resume.
+- If new Telegram ACP routing issues appear, use this file as the execution record and create a follow-up plan instead of reopening scope implicitly.
 - Execute one phase at a time using a tests-first loop, then run the phase verify commands, then perform a review/fix pass before moving to the next phase.
 - Keep cron and unattended ACP behavior stable while changing interactive Telegram routing.
 - Ask the user only if implementation reveals that existing ACP policy surfaces cannot express the trusted-single-user default without a schema change.
@@ -126,6 +127,7 @@
 - `AC4` ACP `/new` reliably produces a fresh backend session on the next Telegram prompt instead of resuming the previous persisted binding.
 - `AC5` Trusted Telegram ACP sessions avoid approval prompts by default while keeping `ask` and `deny` capable for future use and leaving unattended cron policy behavior unchanged.
 - `AC6` ACP permission, filesystem, and terminal callback decisions are sent back to the ACP agent so command execution can complete instead of stalling.
+- `AC7` Telegram's native command menu reflects the available local and ACP-advertised slash commands, and startup retry behavior prevents the menu from getting stuck on a local-only baseline when ACP command discovery lags service boot.
 
 ## BDD scenarios
 
@@ -153,6 +155,8 @@
 - Add a failing test proving slash-command forwarding includes the same Telegram metadata fields (`message_id`, `user_id`, `username`, `first_name`, `is_group`) that ordinary message ingress publishes.
 - Include a guardrail test that plain text still routes through `_on_message()` so the command pass-through change does not break non-command chat behavior.
 - Include a failure-path test for malformed or empty normalized group commands so the Telegram layer does not emit invalid slash content.
+- Include a guardrail test for group-chat commands explicitly addressed to a different bot (for example `/init@otherbot`) so nanobot does not hijack commands that were not meant for it.
+- Add a failing startup-registration test proving Telegram command-menu sync includes ACP-advertised commands and retries when ACP command discovery is not ready on the first boot attempt.
 
 ### Expected files
 
@@ -164,6 +168,8 @@
 - Adjust Telegram handler registration so explicit local commands run first and a generic command-forwarding path handles everything else.
 - Normalize Telegram bot-mention command syntax before publishing to the bus.
 - Preserve the same Telegram metadata payload shape for command ingress that `_on_message()` currently produces for normal text messages.
+- Ignore group-chat commands addressed to a different bot username while preserving normalization for commands addressed to nanobot.
+- Register Telegram native command-menu entries from ACP-advertised slash commands and add startup retry logic so delayed ACP discovery does not leave the menu stale after service restart.
 - Keep Telegram thin: do not add OpenCode-specific command parsing or Telegram-only business logic beyond normalization and handler routing.
 - Preserve existing ACL, sender ID, typing indicator, and media behavior.
 
@@ -185,6 +191,7 @@
 - Add a failing restart/resume regression test showing that `/new` must delete the existing ACP binding from `ACPSessionBindingStore`, not only remove the live client, before the next prompt creates a fresh session.
 - Keep a guardrail assertion for `/stop` local cancellation behavior so command-forwarding changes do not regress existing stop semantics.
 - Add a parity-oriented failure-path test showing ACP routing errors still surface through the current ACP failure path when the inbound Telegram content is a slash command.
+- Add a failing reuse-session regression test proving ACP update subscriptions are cleared or rebound between prompts so progress updates cannot leak into the wrong Telegram callback when the same ACP session is reused.
 
 ### Expected files
 
@@ -197,6 +204,7 @@
 - Preserve inbound `InboundMessage.metadata` on the final `OutboundMessage` returned from ACP routing.
 - Split update subscription logic from the `acp_stream_content` flag so other ACP visibility categories can be surfaced independently.
 - Add or adapt a fresh-session reset path in `ACPService` that clears both the live client and the persisted binding for a session key.
+- Clear stale ACP update sinks whenever a prompt path does not attach a new visible-progress sink, and rebind the sink explicitly when progress visibility is enabled on a reused ACP session.
 - Keep existing local fallback and session-key behavior intact.
 
 ### Verify
@@ -250,6 +258,7 @@
 - Add failing tests for filesystem and terminal callback decisions being returned to the agent, not just logged locally.
 - Include a denial-path test so the callback round-trip covers both allowed and denied outcomes and ensures decision updates still surface.
 - Add a failing integration-oriented test showing the live ACP service path registers real filesystem and terminal handlers before slash-command-driven OpenCode work reaches the SDK adapter.
+- Add a failing policy-enforcement test proving live filesystem and terminal callback wiring still respects `ask` and `deny` policy outcomes after the real handlers are attached.
 
 ### Expected files
 
@@ -268,6 +277,7 @@
 - Keep payload conversion aligned with existing ACP normalization helpers and update-event shapes.
 - Avoid introducing a live OpenCode dependency into the default test suite; use fakes or mocked connection objects for RED and GREEN verification.
 - Preserve denial-path behavior and update emission semantics so stricter policies remain observable once callback responses are wired.
+- Verify that the live-handler path cannot bypass `ask` or `deny` decisions after callback round-trips are enabled.
 
 ### Verify
 
@@ -307,6 +317,8 @@
 - 2026-03-12: Phase 4 bound live filesystem and terminal handler objects into `ACPService` client creation, and `SDKNotificationHandler` now returns callback decisions over the active SDK connection while preserving permission decision updates for observability.
 - 2026-03-12: Phase 4 review hardening advertised ACP filesystem and terminal client capabilities, routed direct filesystem and terminal callbacks through permission enforcement, separated live execution-handler wiring from approval callbacks, and fixed denial/error branches so `ask`/`deny` policies cannot be bypassed or crash on rejected callback paths.
 - 2026-03-12: Post-review hardening clears stale ACP update sinks between prompts so reused sessions cannot leak progress into the wrong channel callback, and terminal lifecycle callback failures now map to structured protocol errors instead of surfacing as internal SDK exceptions.
+- 2026-03-12: Telegram command registration now probes ACP `available_commands_update` data and merges valid advertised slash commands into the native Telegram command menu, because forwarding unknown slash commands alone left users stuck on the original static `/start` `/new` `/stop` `/help` catalog.
+- 2026-03-12: Telegram startup now retries command registration after boot when ACP slash commands are not ready on the first pass, because Homebrew service restarts could connect to Telegram before ACP command discovery settled and leave the bot menu stuck on the local-only baseline.
 
 ## Plan Changelog
 

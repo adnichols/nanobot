@@ -133,6 +133,47 @@ async def test_handler_converts_structured_updates_to_internal_events():
 
 
 @pytest.mark.asyncio
+async def test_handler_tracks_available_commands_updates():
+    from nanobot.acp.sdk_client import SDKNotificationHandler
+
+    handler = SDKNotificationHandler()
+
+    await handler(
+        "session/update",
+        {
+            "sessionId": "sess-123",
+            "update": {
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": [
+                    {"name": "model", "description": "Switch models"},
+                    {"name": "status", "description": "Show status"},
+                ],
+            },
+        },
+        True,
+    )
+
+    assert handler.available_commands_for_session("sess-123") == [
+        {"name": "model", "description": "Switch models"},
+        {"name": "status", "description": "Show status"},
+    ]
+
+
+def test_sdk_client_reports_current_available_commands():
+    from nanobot.acp.sdk_client import SDKClient, SDKNotificationHandler
+
+    client = SDKClient(agent_path=None)
+    handler = SDKNotificationHandler()
+    handler._available_commands["sess-123"] = [{"name": "model", "description": "Switch models"}]
+    client._notification_handler = handler
+    client._current_session_id = "sess-123"
+
+    assert client.current_available_commands() == [
+        {"name": "model", "description": "Switch models"}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_permission_decision_is_sent_back_over_sdk_connection():
     from nanobot.acp.sdk_client import SDKNotificationHandler
     from nanobot.acp.types import ACPFilesystemCallback, ACPPermissionDecision

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from typing import Any, cast
 
 from loguru import logger
 from telegram import BotCommand, ReplyParameters, Update
@@ -110,28 +111,122 @@ class TelegramChannel(BaseChannel):
 
     name = "telegram"
 
-    # Commands registered with Telegram's command menu
-    BOT_COMMANDS = [
-        BotCommand("start", "Start the bot"),
-        BotCommand("new", "Start a new conversation"),
-        BotCommand("stop", "Stop the current task"),
-        BotCommand("help", "Show available commands"),
+    LOCAL_COMMAND_SPECS = [
+        ("start", "Start the bot"),
+        ("new", "Start a new conversation"),
+        ("stop", "Stop the current task"),
+        ("help", "Show available commands"),
     ]
+    TELEGRAM_COMMAND_RE = re.compile(r"^[a-z0-9_]{1,32}$")
 
     def __init__(
         self,
         config: TelegramConfig,
         bus: MessageBus,
         groq_api_key: str = "",
+        acp_service: Any = None,
     ):
         super().__init__(config, bus)
         self.config: TelegramConfig = config
         self.groq_api_key = groq_api_key
+        self._acp_service = acp_service
         self._app: Application | None = None
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
         self._media_group_buffers: dict[str, dict] = {}
         self._media_group_tasks: dict[str, asyncio.Task] = {}
+        self._command_refresh_task: asyncio.Task | None = None
+
+    @classmethod
+    def _local_bot_commands(cls) -> list[BotCommand]:
+        """Return nanobot-local commands that should always appear in Telegram."""
+        return [BotCommand(name, description) for name, description in cls.LOCAL_COMMAND_SPECS]
+
+    @classmethod
+    def _acp_bot_commands(cls, commands: list[dict[str, object]] | None) -> list[BotCommand]:
+        """Convert ACP-advertised slash commands into Telegram command menu entries."""
+        if not commands:
+            return []
+
+        registered = {name for name, _description in cls.LOCAL_COMMAND_SPECS}
+        bot_commands: list[BotCommand] = []
+        for item in commands:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip().lstrip("/")
+            if not cls.TELEGRAM_COMMAND_RE.fullmatch(name):
+                continue
+            if name in registered:
+                continue
+
+            description = str(item.get("description") or "").strip()
+            if not description:
+                input_data = item.get("input")
+                if isinstance(input_data, dict):
+                    description = str(input_data.get("hint") or "").strip()
+            description = (description.splitlines()[0] if description else f"Run /{name}")[:256]
+            bot_commands.append(BotCommand(name, description))
+            registered.add(name)
+
+        return bot_commands
+
+    async def _bot_commands_for_registration(self) -> list[BotCommand]:
+        """Build the Telegram command menu, including ACP commands when available."""
+        commands = self._local_bot_commands()
+        if self._acp_service is None:
+            return commands
+
+        try:
+            acp_commands = await self._acp_service.discover_available_commands()
+        except Exception as exc:
+            logger.warning("Failed to discover ACP bot commands: {}", exc)
+            return commands
+
+        return commands + self._acp_bot_commands(acp_commands)
+
+    async def _register_bot_commands(self) -> list[BotCommand]:
+        """Register the current Telegram command menu and return what was applied."""
+        app = self._app
+        if app is None:
+            return []
+
+        commands = await self._bot_commands_for_registration()
+        await app.bot.set_my_commands(commands)
+        logger.debug(
+            "Telegram bot commands registered: {}",
+            [command.command for command in commands],
+        )
+        return commands
+
+    async def _refresh_bot_commands_until_acp_ready(self) -> None:
+        """Retry Telegram command registration until ACP commands are available."""
+        if self._acp_service is None:
+            return
+
+        local_count = len(self.LOCAL_COMMAND_SPECS)
+        for attempt in range(1, 6):
+            await asyncio.sleep(3 * attempt)
+            if not self._running or self._app is None:
+                return
+
+            try:
+                commands = await self._register_bot_commands()
+            except Exception as exc:
+                logger.warning(
+                    "Retry {} failed while refreshing Telegram commands: {}",
+                    attempt,
+                    exc,
+                )
+                continue
+
+            if len(commands) > local_count:
+                logger.debug(
+                    "Telegram ACP commands became available on retry {}",
+                    attempt,
+                )
+                return
+
+        logger.warning("Telegram ACP commands were still unavailable after startup retries")
 
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
@@ -151,16 +246,17 @@ class TelegramChannel(BaseChannel):
         if self.config.proxy:
             builder = builder.proxy(self.config.proxy).get_updates_proxy(self.config.proxy)
         self._app = builder.build()
-        self._app.add_error_handler(self._on_error)
+        app = self._app
+        app.add_error_handler(self._on_error)
 
         # Add command handlers
-        self._app.add_handler(CommandHandler("start", self._on_start))
-        self._app.add_handler(CommandHandler("new", self._forward_command))
-        self._app.add_handler(CommandHandler("help", self._on_help))
-        self._app.add_handler(MessageHandler(filters.COMMAND, self._forward_command))
+        app.add_handler(CommandHandler("start", self._on_start))
+        app.add_handler(CommandHandler("new", self._forward_command))
+        app.add_handler(CommandHandler("help", self._on_help))
+        app.add_handler(MessageHandler(filters.COMMAND, self._forward_command))
 
         # Add message handler for text, photos, voice, documents
-        self._app.add_handler(
+        app.add_handler(
             MessageHandler(
                 (
                     filters.TEXT
@@ -177,21 +273,28 @@ class TelegramChannel(BaseChannel):
         logger.info("Starting Telegram bot (polling mode)...")
 
         # Initialize and start polling
-        await self._app.initialize()
-        await self._app.start()
+        await app.initialize()
+        await app.start()
 
         # Get bot info and register command menu
-        bot_info = await self._app.bot.get_me()
+        bot_info = await app.bot.get_me()
         logger.info("Telegram bot @{} connected", bot_info.username)
 
         try:
-            await self._app.bot.set_my_commands(self.BOT_COMMANDS)
-            logger.debug("Telegram bot commands registered")
+            commands = await self._register_bot_commands()
+            if self._acp_service is not None and len(commands) == len(self.LOCAL_COMMAND_SPECS):
+                logger.info("Telegram ACP commands not ready at startup; scheduling refresh")
+                self._command_refresh_task = asyncio.create_task(
+                    self._refresh_bot_commands_until_acp_ready()
+                )
         except Exception as e:
             logger.warning("Failed to register bot commands: {}", e)
 
         # Start polling (this runs until stopped)
-        await self._app.updater.start_polling(
+        updater = cast(Any, app.updater)
+        if updater is None:
+            raise RuntimeError("Telegram updater is unavailable")
+        await updater.start_polling(
             allowed_updates=["message"],
             drop_pending_updates=True,  # Ignore old messages on startup
         )
@@ -213,11 +316,22 @@ class TelegramChannel(BaseChannel):
         self._media_group_tasks.clear()
         self._media_group_buffers.clear()
 
+        if self._command_refresh_task is not None:
+            self._command_refresh_task.cancel()
+            try:
+                await self._command_refresh_task
+            except asyncio.CancelledError:
+                pass
+            self._command_refresh_task = None
+
         if self._app:
+            app = self._app
             logger.info("Stopping Telegram bot...")
-            await self._app.updater.stop()
-            await self._app.stop()
-            await self._app.shutdown()
+            updater = cast(Any, app.updater)
+            if updater is not None:
+                await updater.stop()
+            await app.stop()
+            await app.shutdown()
             self._app = None
 
     @staticmethod
@@ -430,7 +544,7 @@ class TelegramChannel(BaseChannel):
             media_type = "file"
 
         # Download media if present
-        if media_file and self._app:
+        if media_file and self._app and media_type is not None:
             try:
                 file = await self._app.bot.get_file(media_file.file_id)
                 ext = self._get_extension(media_type, getattr(media_file, "mime_type", None))

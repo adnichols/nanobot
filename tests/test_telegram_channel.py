@@ -1,4 +1,6 @@
 from types import SimpleNamespace
+from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -52,6 +54,101 @@ def _make_update(
 
 def _make_context(bot_username: str = "nanobot") -> SimpleNamespace:
     return SimpleNamespace(bot=SimpleNamespace(username=bot_username))
+
+
+def test_acp_bot_commands_include_valid_unique_commands_only() -> None:
+    commands = TelegramChannel._acp_bot_commands(
+        [
+            {"name": "model", "description": "Switch models"},
+            {"name": "status", "input": {"hint": "Show session status"}},
+            {"name": "help", "description": "Duplicate local command"},
+            {"name": "bad-command", "description": "Telegram rejects hyphens"},
+        ]
+    )
+
+    assert [(command.command, command.description) for command in commands] == [
+        ("model", "Switch models"),
+        ("status", "Show session status"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_bot_commands_for_registration_include_acp_commands() -> None:
+    acp_service = SimpleNamespace(
+        discover_available_commands=AsyncMock(
+            return_value=[
+                {"name": "model", "description": "Switch models"},
+                {"name": "status", "description": "Show session status"},
+            ]
+        )
+    )
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="token", allow_from=["*"]),
+        MessageBus(),
+        acp_service=acp_service,
+    )
+
+    commands = await channel._bot_commands_for_registration()
+
+    assert [command.command for command in commands] == [
+        "start",
+        "new",
+        "stop",
+        "help",
+        "model",
+        "status",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_register_bot_commands_applies_built_menu() -> None:
+    channel = _make_channel()
+    app = SimpleNamespace(bot=SimpleNamespace(set_my_commands=AsyncMock()))
+    channel._app = cast(Any, app)
+
+    monkey_commands = [SimpleNamespace(command="start"), SimpleNamespace(command="review")]
+
+    async def _fake_bot_commands_for_registration() -> list[SimpleNamespace]:
+        return monkey_commands
+
+    channel._bot_commands_for_registration = _fake_bot_commands_for_registration  # type: ignore[method-assign]
+
+    commands = await channel._register_bot_commands()
+
+    assert commands == monkey_commands
+    app.bot.set_my_commands.assert_awaited_once_with(monkey_commands)
+
+
+@pytest.mark.asyncio
+async def test_refresh_bot_commands_retries_until_acp_commands_appear(monkeypatch) -> None:
+    acp_service = SimpleNamespace(discover_available_commands=AsyncMock())
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="token", allow_from=["*"]),
+        MessageBus(),
+        acp_service=acp_service,
+    )
+    channel._app = cast(Any, SimpleNamespace())
+    channel._running = True
+
+    calls: list[int] = []
+
+    async def _fake_sleep(_seconds: float) -> None:
+        return None
+
+    async def _fake_register_bot_commands() -> list[SimpleNamespace]:
+        calls.append(1)
+        if len(calls) == 1:
+            return [SimpleNamespace(command=name) for name in ["start", "new", "stop", "help"]]
+        return [
+            SimpleNamespace(command=name) for name in ["start", "new", "stop", "help", "review"]
+        ]
+
+    monkeypatch.setattr("nanobot.channels.telegram.asyncio.sleep", _fake_sleep)
+    channel._register_bot_commands = _fake_register_bot_commands  # type: ignore[method-assign]
+
+    await channel._refresh_bot_commands_until_acp_ready()
+
+    assert len(calls) == 2
 
 
 @pytest.mark.asyncio

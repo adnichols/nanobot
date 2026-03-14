@@ -47,6 +47,7 @@ class ACPService:
         self._clients: dict[str, SDKClient] = {}
         # Cache capabilities from initialize responses
         self._capabilities: dict[str, Any] = {}
+        self._available_commands: dict[str, list[dict[str, Any]]] = {}
         self._filesystem_handler: Any = None
         self._terminal_manager: Any = None
 
@@ -124,6 +125,7 @@ class ACPService:
         # Cache capabilities for this agent
         if client.capabilities:
             self._capabilities[agent_id] = client.capabilities
+        self._cache_available_commands(agent_id, result.get("available_commands"))
 
         # Store the binding
         if self._binding_store:
@@ -165,6 +167,10 @@ class ACPService:
                 binding.acp_agent_id
                 if binding is not None
                 else getattr(self._config.agent_definition, "id", None) or "default"
+            )
+            self._cache_available_commands(
+                agent_id,
+                active_client.current_available_commands(active_client.current_session_id),
             )
             return {
                 "nanobot_session_key": nanobot_session_key,
@@ -240,6 +246,7 @@ class ACPService:
 
         # Track the client
         self._clients[nanobot_session_key] = client
+        self._cache_available_commands(binding.acp_agent_id, result.get("available_commands"))
 
         return {
             "nanobot_session_key": nanobot_session_key,
@@ -248,6 +255,34 @@ class ACPService:
             "status": status,
             "session": result.get("session"),
         }
+
+    def _cache_available_commands(self, agent_id: str, commands: Any) -> None:
+        """Cache advertised ACP slash commands for later channel registration."""
+        if not isinstance(commands, list):
+            return
+        normalized: list[dict[str, Any]] = []
+        for item in commands:
+            if isinstance(item, dict):
+                normalized.append(dict(item))
+        self._available_commands[agent_id] = normalized
+
+    async def discover_available_commands(self, agent_id: str = "default") -> list[dict[str, Any]]:
+        """Probe the configured ACP agent for its advertised slash commands."""
+        cached = self._available_commands.get(agent_id)
+        if cached:
+            return [dict(item) for item in cached]
+
+        client = self._create_client()
+        try:
+            await client.initialize()
+            if client.capabilities:
+                self._capabilities[agent_id] = client.capabilities
+            result = await client.new_session()
+            commands = result.get("available_commands")
+            self._cache_available_commands(agent_id, commands)
+            return [dict(item) for item in self._available_commands.get(agent_id, [])]
+        finally:
+            await client.shutdown()
 
     async def process_message(
         self,
@@ -396,6 +431,10 @@ class ACPService:
             "capabilities": client.capabilities,
             "binding": binding.to_dict() if binding else None,
         }
+
+    def get_available_commands(self, agent_id: str = "default") -> list[dict[str, Any]]:
+        """Return cached ACP slash commands for an agent."""
+        return [dict(item) for item in self._available_commands.get(agent_id, [])]
 
     @property
     def active_sessions(self) -> list[str]:

@@ -111,6 +111,8 @@ class SDKNotificationHandler:
         self._pending_responses: dict[str, asyncio.Future] = {}
         self._stream_chunks: dict[str, list[ACPStreamChunk]] = {}
         self._stream_callbacks: dict[str, StreamChunkCallback] = {}
+        self._available_commands: dict[str, list[dict[str, Any]]] = {}
+        self._available_command_events: dict[str, asyncio.Event] = {}
 
     async def __call__(self, method: str, params: Any, is_notification: bool) -> Any | None:
         """Handle an incoming method call from the agent.
@@ -125,6 +127,7 @@ class SDKNotificationHandler:
 
         # Route based on method
         if method == "session/update":
+            self._handle_available_commands_update(params)
             await self._record_stream_chunk(params)
             self._handle_session_update(params)
             return None
@@ -216,6 +219,56 @@ class SDKNotificationHandler:
             return
 
         asyncio.create_task(self._update_sink.send_update(event))
+
+    def _handle_available_commands_update(self, params: dict[str, Any]) -> None:
+        """Capture available slash commands advertised by the ACP agent."""
+        session_id = params.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            return
+
+        update = params.get("update", {})
+        if not isinstance(update, dict):
+            return
+
+        session_update = update.get("session_update", {})
+        kind = session_update.get("kind") if isinstance(session_update, dict) else None
+        if kind not in {"available_commands", "available_commands_update"}:
+            return
+
+        raw_commands = update.get("available_commands")
+        if not isinstance(raw_commands, list):
+            return
+
+        normalized: list[dict[str, Any]] = []
+        for item in raw_commands:
+            if not isinstance(item, dict):
+                continue
+            normalized.append(dict(item))
+
+        self._available_commands[session_id] = normalized
+        self._available_command_events.setdefault(session_id, asyncio.Event()).set()
+
+    def available_commands_for_session(self, session_id: str) -> list[dict[str, Any]]:
+        """Return the last available-commands update for a session."""
+        return [dict(item) for item in self._available_commands.get(session_id, [])]
+
+    async def wait_for_available_commands(
+        self,
+        session_id: str,
+        *,
+        timeout: float = 1.0,
+    ) -> list[dict[str, Any]]:
+        """Wait briefly for an available-commands update for a session."""
+        existing = self.available_commands_for_session(session_id)
+        if existing:
+            return existing
+
+        event = self._available_command_events.setdefault(session_id, asyncio.Event())
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return self.available_commands_for_session(session_id)
+        return self.available_commands_for_session(session_id)
 
     def _convert_session_update(self, params: dict[str, Any]) -> ACPUpdateEvent | None:
         """Convert a normalized session/update payload into an internal ACP event."""
@@ -1314,6 +1367,7 @@ class SDKClient:
             return {
                 "session_id": session_id,
                 "status": "created",
+                "available_commands": [],
             }
 
         try:
@@ -1326,6 +1380,7 @@ class SDKClient:
 
             result = from_sdk_session_response(response)
             self._current_session_id = result.get("session_id")
+            await self._attach_available_commands(result)
 
             return result
 
@@ -1354,6 +1409,7 @@ class SDKClient:
             return {
                 "session_id": session_id,
                 "status": "loaded",
+                "available_commands": [],
                 "session": {
                     "id": session_id,
                     "state": {},
@@ -1371,6 +1427,7 @@ class SDKClient:
 
             result = from_sdk_session_response(response)
             self._current_session_id = session_id
+            await self._attach_available_commands(result)
 
             return result
 
@@ -1492,6 +1549,13 @@ class SDKClient:
         except Exception as e:
             logger.warning(f"Cancel failed: {e}")
 
+    def current_available_commands(self, session_id: Optional[str] = None) -> list[dict[str, Any]]:
+        """Return cached ACP slash commands for the current or provided session."""
+        target_session = session_id or self._current_session_id
+        if not target_session or self._notification_handler is None:
+            return []
+        return self._notification_handler.available_commands_for_session(target_session)
+
     async def close(self) -> None:
         """Close the client and cleanup resources."""
         # Exit the connection context if it exists
@@ -1511,6 +1575,19 @@ class SDKClient:
     async def shutdown(self) -> None:
         """Shutdown the client (alias for close())."""
         await self.close()
+
+    async def _attach_available_commands(self, result: dict[str, Any]) -> None:
+        """Attach advertised ACP slash commands to a session result when available."""
+        session_id = result.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            return
+
+        handler = self._notification_handler
+        if handler is None:
+            return
+
+        commands = await handler.wait_for_available_commands(session_id)
+        result["available_commands"] = commands
 
     def subscribe_updates(self, sink: ACPUpdateSink) -> None:
         """Subscribe to update events.
